@@ -1,4 +1,4 @@
-# SILENT HILL: DOWNPOUR / Nintendo Switch - 0.1.0 test (free, t.me/fspores)
+# SILENT HILL: DOWNPOUR / Nintendo Switch - 0.2.0 (free, t.me/fspores)
 # ReXGlue port; SDK masseffect-nx + prototype2-nx patch; native renderer from prototype2-nx (penettrator).
 p2_renderer = "native"
 shd_renderer = "p2"   # "p2" = рендер Prototype 2, "me" = Mass Effect NX
@@ -54,5 +54,5 @@ p2_native_occlusion_queries = false
 
 # Внутреннее разрешение: 640x360, 960x540 или 1280x720 (как в игре). Меньше = быстрее и холоднее.
 # Удобнее менять экраном настроек: + в первые 5 секунд после запуска с иконки. Требует перезапуска.
-shd_render_width = 960
-shd_render_height = 540
+shd_render_width = 640
+shd_render_height = 360

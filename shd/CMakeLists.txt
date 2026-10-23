@@ -3,7 +3,7 @@
 # renderer: prototype2-nx native renderer (nfsmw-nx -> project8-sw -> Mercs2-NX -> Prototype 2).
 # GPL-3.0-or-later (the native renderer is GPL-3.0).
 cmake_minimum_required(VERSION 3.25)
-project(shd VERSION 0.1.0 LANGUAGES C CXX)
+project(shd VERSION 0.2.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
