@@ -21,7 +21,7 @@ Ready builds (NRO, settings, HOME-menu NSP forwarder): see **Releases**.
 
 | | Silent Hill: Downpour |
 |---|---|
-| Picture | 960x540 + FSR 1 by default; 640x360 and 1280x720 (the game's own) on the settings screen |
+| Picture | 640x360 + FSR 1 by default (recommended); 960x540 and 1280x720 (the game's own) on the settings screen |
 | FPS* | 30 |
 | Sound, music, FMV | yes |
 | Saves | yes |
@@ -65,7 +65,7 @@ The code is recompiled from one specific `default.xex`; other editions may not s
 
 | Key | Default | |
 |---|---|---|
-| `shd_render_width` x `shd_render_height` | 960x540 | internal resolution: 640x360, 960x540 or 1280x720 |
+| `shd_render_width` x `shd_render_height` | 640x360 | internal resolution: 640x360, 960x540 or 1280x720 |
 | `present_effect` | `"fsr"` | `"bilinear"` is slightly faster and softer |
 | `p2_native_max_anisotropy` | 16 | 8 or 4 are faster |
 | `p2_native_max_mip_levels` | 1 | **leave at 1**: more mip levels bring back square artefacts |

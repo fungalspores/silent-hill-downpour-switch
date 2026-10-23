@@ -57,7 +57,7 @@ static const option options[] =
       "Внутреннее, растягивается на экран. Меньше — быстрее и холоднее, но мыльнее.",
       "Internal, scaled to the screen. Lower is faster and cooler but softer.",
       { "640", "960", "1280", NULL },
-      { "640x360", "960x540", "1280x720", NULL }, "960" },
+      { "640x360", "960x540", "1280x720", NULL }, "640" },
 };
 
 #define OPTION_COUNT ((int)(sizeof(options) / sizeof(options[0])))
