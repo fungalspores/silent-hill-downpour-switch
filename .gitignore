@@ -1,0 +1,8 @@
+build/
+*.nro
+*.elf
+*.mesp
+*.idx
+logs/
+game/
+*.log
