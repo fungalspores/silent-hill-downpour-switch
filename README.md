@@ -36,7 +36,7 @@ Needs Atmosphère 1.8.0+ with sigpatches, DBI (or another NSP installer), about 
 1. Copy `switch/` from the release to the root of the SD card:
    ```
    sdmc:/switch/rex-start.nro
-   sdmc:/switch/shd-nx/shd.nro, shd.toml, shd/cache/
+   sdmc:/switch/shd-nx/shd.nro, shd.toml, shd/cache/ (prewarm list)
    ```
 2. Put your game files into `sdmc:/switch/shd-nx/game/` (with `default.xex` inside).
    From an ISO: `extract-xiso -x "SilentHillDownpour.iso" -d game`. `$SystemUpdate` is not needed.
@@ -47,9 +47,10 @@ Needs Atmosphère 1.8.0+ with sigpatches, DBI (or another NSP installer), about 
    Without an NSP: hold **R** while starting any installed game and run `switch/shd-nx/shd.nro` from the Homebrew menu.
    **Not from the Album:** applet mode does not have enough memory.
 
-`shd/cache/` holds about 70 MB of already compiled pipelines. Without it the game compiles every new material the
-first time it appears and the frame stops for that time. The file name carries the GPU model and the driver
-version, which are the same on every Switch, so the cache fits everyone.
+Neither the shader library nor compiled shaders are shipped: both are made from the game's own shaders. `shd/cache/`
+holds only the prewarm list (pipeline keys and hashes, no shader code). On the first start the game compiles those
+pipelines in the background from your library, so the first minutes may stutter; after that the driver cache on
+your card covers it.
 
 ### Tested edition
 
