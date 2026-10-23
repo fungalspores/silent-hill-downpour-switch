@@ -2182,7 +2182,13 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
           }
           auto usable = [&](const ResolveDestination* c) {
             return c && bytes_of(c->format) == want &&
-                   (!c->last_written_pixels || c->last_written_pixels * 4 >= want_pixels) &&
+                   // Must cover what the fetch reads, near enough. The old rule accepted anything
+                   // over a quarter, and with shd_render_width a half-size resolve has exactly a
+                   // quarter of the pixels: it passed, and the shader read a half-size picture
+                   // into a full-size fetch -- the frame appeared again, small and dark, in the
+                   // top-left corner of itself (measured on the menu: 640x366 of a 1280x720).
+                   (!c->last_written_pixels ||
+                    c->last_written_pixels * 4 >= want_pixels * 3) &&
                    (!have_bias || !c->exp_bias_known || c->last_written_exp_bias == newest_bias);
           };
           auto better = [&](const ResolveDestination* c, const ResolveDestination* best) {

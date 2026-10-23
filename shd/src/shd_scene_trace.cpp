@@ -46,7 +46,21 @@ uint32_t g_w = 0, g_h = 0, g_pf = 0;
 
 // RHICreateTargetableSurface(sret, w, h, pixel format, texture, name, ...)
 REX_EXTERN(__imp__sub_829CC6D8);
+bool ShdScaleSurfaceSize(uint32_t& w, uint32_t& h);
+void ShdLogRenderScaleOnce();
+
 extern "C" REX_FUNC(sub_829CC6D8) {
+  // shd_render_width / shd_render_height: the engine is asked for smaller scene buffers, and the
+  // presenter scales the frame to the screen. Done before the call so everything the engine
+  // derives from this surface (half- and quarter-size effect buffers) follows.
+  {
+    uint32_t w = ctx.r4.u32, h = ctx.r5.u32;
+    if (ShdScaleSurfaceSize(w, h)) {
+      ctx.r4.u32 = w;
+      ctx.r5.u32 = h;
+      ShdLogRenderScaleOnce();
+    }
+  }
   const bool on = REXCVAR_GET(shd_diag_scene_trace);
   if (on) {
     std::lock_guard<std::mutex> lock(g_mutex);

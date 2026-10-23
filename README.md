@@ -66,6 +66,17 @@ Do not launch through the Album — the game does not get enough memory in that 
   2D stack; the renderer handed back the whole strip as a single layer, which made the title screen
   red and cyan
 
+## Internal resolution
+
+`shd_render_width` / `shd_render_height` in `shd.toml`, or the settings screen (press **+** in the first five
+seconds after launching from the HOME menu). Three sizes: 640x360, 960x540 and 1280x720 (the game's own).
+Lower is faster and cooler; at 640x360 the forest holds 30 fps at about 57 °C instead of 70 °C.
+
+The game's own coordinates are never changed. Render targets keep their guest size in every piece of guest logic
+(EDRAM tiles, resolve rectangles, texture identity by address and size); only the Vulkan images and commands are
+scaled, by quarter steps, and a resolve stretches the smaller image back to the guest size. Depth that the game
+reads back texel by texel is first copied into a full-size image (`DepthFullSize`).
+
 ## Settings
 
 `switch/shd-nx/shd.toml`, next to the NRO. Close the game fully after editing.

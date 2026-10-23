@@ -13,6 +13,17 @@
 
 #include <rex/ui/gpu_wait_diagnostics.h>
 #include "native_renderer.h"
+#include "native_render_scale.h"
+REXCVAR_DECLARE(uint32_t, shd_scale_pitches);
+REXCVAR_DECLARE(bool, shd_diag_scale);
+namespace {
+// Diagnostics of the internal-resolution path (off for release builds): one switch for every
+// [shd-scale] / [shd-vp] line, read once.
+inline bool ShdDiagScaleOn() {
+  static const bool on = REXCVAR_GET(shd_diag_scale);  // first use is after the config is read
+  return on;
+}
+}  // namespace
 #include "skin_write_log.h"
 #include "native_vk_extra.h"
 #include "native_shader_stats.h"
@@ -38,6 +49,7 @@ extern "C" void RexSwitchPerfSceneFrame(uint32_t draws);
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <unistd.h>  // fsync: a flushed file is not yet a file on the SD card
 #include <thread>
 
 #include <fmt/format.h>
@@ -491,9 +503,14 @@ struct RenderTarget {
   VkImageView stencil_view = VK_NULL_HANDLE;
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+  // The GUEST size: what every guest-side rule about this target is written in terms of.
   uint32_t width = 0;
   uint32_t height = 0;
+  // The host image is the guest size scaled by scale_q / 4 (4 = the game's own resolution).
+  uint32_t scale_q = shd::render_scale::kNative;
   uint64_t last_used_frame = 0;
+  uint32_t HostWidth() const { return shd::render_scale::ScaleSize(width, scale_q); }
+  uint32_t HostHeight() const { return shd::render_scale::ScaleSize(height, scale_q); }
 };
 
 // The attachments of a rendering scope: color 0-3 and depth.
@@ -896,7 +913,9 @@ struct Renderer::Impl {
       render_targets;
   bool in_pass = false;
   PassTargets pass;
+  // The GUEST extent of the pass; the host attachments are this scaled by pass_scale_q / 4.
   VkExtent2D pass_extent = {};
+  uint32_t pass_scale_q = shd::render_scale::kNative;
 
   // Pipelines.
   std::unordered_map<uint64_t, VkPipeline> pipelines;
@@ -938,6 +957,8 @@ struct Renderer::Impl {
   std::filesystem::path driver_cache_path;
   uint64_t pipelines_at_last_save = 0;
   std::chrono::steady_clock::time_point last_pipeline_time;
+  // When the caches were last written: a session that never goes quiet is saved anyway.
+  std::chrono::steady_clock::time_point last_cache_save = std::chrono::steady_clock::now();
   size_t driver_cache_saved_size = 0;
   std::atomic<bool> driver_cache_writing{false};
   std::thread driver_cache_writer;
@@ -2037,6 +2058,16 @@ struct Renderer::Impl {
   std::vector<PrewarmShader> prewarm_shader_list;
   std::unordered_set<uint64_t> prewarm_shader_hashes;
   std::vector<PipelineKey> prewarm_keys;
+  // The keys read from the prewarm file at start: the ones the prewarm thread built. Creating one
+  // of them here should hit the driver's cache; if it does not, the prewarm is not helping.
+  std::unordered_set<uint64_t> prewarm_loaded_hashes;
+  static constexpr uint64_t kPrewarmSlowNs = 20000000;  // 20 ms: as slow as a real compile
+  static constexpr uint32_t kPrewarmCheckAfter = 8;     // report once, after this many hits
+  uint32_t prewarm_hit_count = 0, prewarm_slow_count = 0;
+  bool PrewarmKnew(const PipelineKey& key) const {
+    return !prewarm_loaded_hashes.empty() &&
+           prewarm_loaded_hashes.count(XXH3_64bits(&key, sizeof(key))) != 0;
+  }
   std::unordered_set<uint64_t> prewarm_key_hashes;
   size_t prewarm_saved_keys = 0;
   std::thread prewarm_thread;
@@ -2239,6 +2270,20 @@ struct Renderer::Impl {
                              const VulkanShader* vs, const VulkanShader* ps);
   void Resolve();
   bool resolve_barrier_pending = false;
+  bool BlitScaledResolve(VkCommandBuffer c, const RenderTarget& source,
+                         const ResolveDestination& dest, int32_t x0, int32_t y0, uint32_t width,
+                         uint32_t height, uint32_t sample_x, uint32_t sample_y);
+  struct DepthFullSizeImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; bool prepared = false; };
+  std::unordered_map<uint64_t, DepthFullSizeImage> scale_staging;
+  uint64_t scaled_resolve_direct = 0, scaled_resolve_staged = 0, scaled_resolve_failed = 0,
+           scaled_resolve_plain = 0;
+  bool BlitScaledResolveStaged(VkCommandBuffer c, const RenderTarget& source,
+                               ResolveDestination& dest, int32_t x0, int32_t y0, uint32_t width,
+                               uint32_t height, float resolve_scale, uint32_t resolve_clamp,
+                               uint32_t sample_x = 1, uint32_t sample_y = 1);
+  std::unordered_map<uint64_t, DepthFullSizeImage> depth_fullsize;
+  VkImage DepthFullSize(VkCommandBuffer c, const RenderTarget& source,
+                        VkImageView* view_out = nullptr);
   void FlushResolveBarrier();
   void Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, uint32_t width, uint32_t height);
   void SaveDriverCache();
@@ -2770,6 +2815,11 @@ bool Renderer::Impl::DepthWordsDirect(VkCommandBuffer c, const RenderTarget& sou
                                       uint32_t dest_width, uint32_t dest_height, int32_t x0,
                                       int32_t y0, uint32_t width, uint32_t height) {
   if (!width || !height || dest.format != VK_FORMAT_R32_SFLOAT) return false;
+  // This reads the depth texel by texel through source.sample_view, in guest coordinates. A target
+  // drawn at q/4 does not have those texels, and the shader walked off the edge of the smaller
+  // image: the shadows and fog it feeds came out as torn blocks. Fall back to the buffer route,
+  // which goes through the full-size scratch (DepthFullSize).
+  if (source.scale_q != shd::render_scale::kNative) return false;
   // Created (or found) before anything is recorded, so a failure leaves no partial work.
   ResolveDestination* words = textures.GetResolveDestination(
       (dest_base & 0x1FFFFFFF) | TextureCache::kDepthWordsTag, dest_width, dest_height,
@@ -3100,8 +3150,29 @@ void Renderer::Impl::Shutdown() {
     record_thread.join();
     record_threaded = false;
   }
+  // Save what this session compiled before going away. The periodic save only fires after five
+  // seconds without a new pipeline, so a session that keeps meeting new materials -- or is closed
+  // with HOME, the usual way -- wrote nothing at all, and the next start compiled the same
+  // pipelines again (log shd_143: 90 pipelines built, both cache files unchanged to the byte).
   if (driver_cache_writer.joinable()) {
     driver_cache_writer.join();
+  }
+  if (!driver_cache_path.empty() && stats().pipelines_created != pipelines_at_last_save) {
+    REXLOG_INFO("[native] saving the driver cache at exit: {} pipelines built since the last save",
+                stats().pipelines_created - pipelines_at_last_save);
+    SaveDriverCache();
+    if (driver_cache_writer.joinable()) {
+      driver_cache_writer.join();
+    }
+  }
+  if (prewarm_enabled && !prewarm_path.empty() && prewarm_keys.size() != prewarm_saved_keys) {
+    if (prewarm_writer.joinable()) {
+      prewarm_writer.join();
+    }
+    SavePrewarm();
+    if (prewarm_writer.joinable()) {
+      prewarm_writer.join();
+    }
   }
   if (!water_dumps.empty()) {
     Submit();
@@ -3154,6 +3225,18 @@ void Renderer::Impl::Shutdown() {
     dfn().vkFreeMemory(vk, retired.memory, nullptr);
   }
   retired_render_targets.clear();
+  for (auto& [key, scratch] : scale_staging) {
+    if (scratch.view) dfn().vkDestroyImageView(vk, scratch.view, nullptr);
+    if (scratch.image) dfn().vkDestroyImage(vk, scratch.image, nullptr);
+    if (scratch.memory) dfn().vkFreeMemory(vk, scratch.memory, nullptr);
+  }
+  scale_staging.clear();
+  for (auto& [key, scratch] : depth_fullsize) {
+    if (scratch.view) dfn().vkDestroyImageView(vk, scratch.view, nullptr);
+    if (scratch.image) dfn().vkDestroyImage(vk, scratch.image, nullptr);
+    if (scratch.memory) dfn().vkFreeMemory(vk, scratch.memory, nullptr);
+  }
+  depth_fullsize.clear();
   if (depth_convert_pipeline) dfn().vkDestroyPipeline(vk, depth_convert_pipeline, nullptr);
   if (depth_convert_layout) dfn().vkDestroyPipelineLayout(vk, depth_convert_layout, nullptr);
   if (depth_copy_pipeline) dfn().vkDestroyPipeline(vk, depth_copy_pipeline, nullptr);
@@ -3461,10 +3544,30 @@ VkPipeline Renderer::Impl::GetPipeline(const PipelineKey& key,
   }
   const uint64_t pipeline_start = NowNs();
   VkPipeline pipeline = CreatePipeline(job);
-  stats().pipeline_ns += NowNs() - pipeline_start;
+  const uint64_t pipeline_ns = NowNs() - pipeline_start;
+  stats().pipeline_ns += pipeline_ns;
   if (pipeline) {
     ++stats().pipelines_created;
     last_pipeline_time = std::chrono::steady_clock::now();
+    // Did the prewarm thread actually help? A pipeline it already built must come out of the
+    // driver's cache in a couple of milliseconds; one that still takes as long as a compile means
+    // the prewarmed key is not the key the ring asks for, and the whole prewarm is wasted work on
+    // a core the game needs. Measured here rather than assumed: the thread reports 950 of 950
+    // pipelines created, which says nothing about whether the ring then found them.
+    if (PrewarmKnew(key)) {
+      ++prewarm_hit_count;
+      if (pipeline_ns >= kPrewarmSlowNs) {
+        ++prewarm_slow_count;
+      }
+      if (prewarm_hit_count == kPrewarmCheckAfter) {
+        REXLOG_INFO("[native] prewarm check: of {} pipelines the prewarm thread had already built, "
+                    "{} still took {} ms or more to create here{}",
+                    prewarm_hit_count, prewarm_slow_count, kPrewarmSlowNs / 1000000,
+                    prewarm_slow_count * 2 >= prewarm_hit_count
+                        ? " -- MISMATCH: the prewarmed keys are not the ones the ring asks for"
+                        : " (the prewarm is working)");
+      }
+    }
     RecordPrewarm(key);
   }
   pipelines.emplace(hash, pipeline);
@@ -4999,7 +5102,16 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   auto rt = std::make_unique<RenderTarget>();
   rt->key = key;
   rt->width = std::max(key.pitch, 1u);
-  rt->height = rex::align(min_height, 16u);
+  // The guest aligns a target's height to the EDRAM tile (16 rows). With a scale of q/4 the host
+  // height must land on a whole tile too, or two targets of the same guest height come out
+  // different host heights (720 * 3/4 = 540, which is not a multiple of 16) and the colour and
+  // depth of one pass disagree by a row: the depth test then lands between pixels and the edges
+  // of foliage and rock turn to noise. Aligning the guest height to 16 * 4 / q keeps both whole.
+  {
+    const uint32_t q = shd::render_scale::WantedQuarters();
+    const uint32_t guest_tile = q == shd::render_scale::kNative ? 16u : (16u * 4u) / q;
+    rt->height = rex::align(min_height, guest_tile);
+  }
   rt->samples = VkSampleCountFlagBits(1u << key.msaa);
   rt->format = key.is_depth ? DepthFormatFor(key.format)
                             : ColorFormatToVk(xenos::ColorRenderTargetFormat(key.format));
@@ -5008,7 +5120,126 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   info.imageType = VK_IMAGE_TYPE_2D;
   info.format = rt->format;
-  info.extent = {rt->width, rt->height, 1};
+  // The guest size stays in rt->width / rt->height; the VkImage is that size scaled (q/4), so
+  // every guest-side rule about this target is untouched and only the Vulkan commands differ.
+  //
+  // Colour and depth are scaled together, always. A pass draws into both, and a depth test only
+  // means anything when the two agree pixel for pixel: a full-size depth under a smaller colour
+  // target made the test land between pixels, and the edges of everything tore (white light
+  // through the trees and the rock, torn silhouettes). Where the guest reads depth back texel by
+  // texel, the scaled image is first blitted to a full-size one (DepthFullSize below).
+  // Only targets as wide as the screen: the scene and what is drawn with it. The engine's small
+  // buffers (shadow maps, the colour grading strip, the reflection) are not screen-sized, and a
+  // shader that reads one addresses it by its own size -- scaling those is what tore the edges.
+  // A target narrower or wider than the screen keeps the guest size and costs nothing extra.
+  // Every target, not a chosen few. Scaling only the 1280-wide ones tore the frame into blocks:
+  // the engine draws one screen through targets of several pitches (640, 880, 1040 in the forest),
+  // and a scaled part next to an unscaled one does not line up. All or nothing.
+  // A target much taller than a screen is not a screen: the shadow cascades live stacked in one
+  // 2048-row map, the colour grading strip in another. The game samples those by their own
+  // coordinates, so they keep the guest size; only what is drawn at screen height is scaled.
+  // Measured (log shd_156): every mismatched pass was a 1280x736 colour against a 1280x2048
+  // depth, which is the shadow atlas, and the depth test across that pair is what put noise on
+  // every edge of the forest.
+  // The rule has to give the same answer for the colour and the depth of one pass, and the only
+  // thing those two share is the pitch: a pass draws into targets of one surface pitch. Height is
+  // not it -- the shadow atlas is 1280x2048 against a 1280x736 colour, and keying on height alone
+  // scaled one of the pair and not the other (log shd_158).
+  //
+  // So: the pitch of the screen (1280) is scaled, every other pitch is left alone. The engine's
+  // own buffers -- the shadow cascades at 560, 320, 160, 80, the half-size effect targets at 640,
+  // the 1040-wide one -- are sampled by their own coordinates and must keep the guest size.
+  // The shadow atlas shares the screen's pitch (1280x2048 against a 1280x736 colour), and a pass
+  // binds the two together: scaling one and not the other is what the mismatches were. The atlas
+  // is depth and far taller than a screen, so that pair of facts names it without touching the
+  // screen's own depth, which is the same shape as its colour.
+  // Measured (log shd_158), the 1280-pitch targets of a frame are:
+  //   colour 1280x736  (formats 0, 2, 3) -- the screen
+  //   depth  1280x1344                   -- the screen's depth (over-allocated, EDRAM is shared)
+  //   depth  1280x2048 format 1          -- the shadow cascades, stacked
+  // The atlas is the one the game samples by its own coordinates. It is depth format 1 at the
+  // full 2048 rows; the screen's own depth, which must scale with its colour, is format 0.
+  // Every 1280-pitch target, the shadow atlas included. Leaving the atlas unscaled sounded right
+  // -- the game samples its cascades by their own coordinates -- but a pass binds it together
+  // with the scaled screen colour, and two attachments of different host sizes is not something
+  // Vulkan or the depth test can make sense of (log shd_159: the mismatch stayed). The cascades
+  // are drawn into the atlas and sampled from it, both through the same scale, so they stay
+  // consistent with each other; what changes is only how many host pixels each cascade covers.
+  // Measured, not reasoned: with the shadow atlas left at the guest size (log shd_159) the forest
+  // came out clean; scaling it as well (log shd_161) brought the noise back. The cascades are
+  // sampled by their own coordinates, and a scaled atlas moves every one of them. The mismatch
+  // the pass check reports for the pair is not a defect: a pass binds a 736-row colour with the
+  // 2048-row atlas and draws into the first 736 rows of both, which is what the guest does too.
+  // The shadow atlas has the screen's pitch but is a stack of cascade maps, and the game samples
+  // each cascade by its own coordinates -- scaling it moves every one of them. It therefore keeps
+  // the guest size, and so must every target a pass binds it with: a 640x368 colour next to a
+  // 1280x2048 depth gives a render area of 640x368, and the cascades are drawn into a corner of
+  // the atlas (log shd_169: the offset copies of Murphy). The colour targets that share a pass
+  // with the atlas are the ones at the screen's own height, so those stay unscaled as well, and
+  // what is scaled is the scene colour the game resolves to the frame.
+  // Everything at the screen's pitch, the shadow atlas included. A pass binds the atlas with the
+  // scene colour, and the render area is the smaller of the two: with the colour scaled and the
+  // atlas not, the cascades were drawn into a corner of the atlas and came back as the offset
+  // copies of Murphy (log shd_169). Both scaled, the area covers both in full, and a cascade
+  // keeps its share of the map -- the sampling coordinates are fractions of the atlas, so they
+  // follow it.
+  // The screen's pitch and the half-size one the engine derives from it. UE3 builds its ambient
+  // occlusion and the effect buffers at half the screen (640x360 of 1280x720) and composites them
+  // back over the scene by fractions of the screen, so they have to follow the same scale: left
+  // alone while the scene was halved, the half-size buffer covered the whole frame and showed as
+  // a rectangle with a silhouette in it, in the menu and in the game alike (log shd_172,
+  // "AmbientOcclusion 640x360" into a 640x864 target).
+  // The 640 pitch is also a shadow cascade map (640x2048), which must keep the guest size: the
+  // half-size screen buffer is the shorter one, under 1024 rows.
+  // The 640 pitch carries both a half-size screen buffer and a shadow cascade map, and they are
+  // told apart by height: a cascade map fills its 2048 rows, the screen buffer is short. But the
+  // engine also puts a 640x360 AuxColor copy into a tall 640 target (log shd_174), so height
+  // alone is not enough -- that one is caught where it resolves, by its 640x360 rectangle.
+  // A 640-pitch COLOUR target is the engine's half-screen buffer (ambient occlusion, AuxColor's
+  // half copy), whatever its allocated height: the cascade maps at that pitch are depth. Keyed on
+  // that, the 640x360 AuxColor copy in a tall target scales with the rest (log shd_174).
+  // A 640-pitch target is either the engine's half-screen buffer or a shadow cascade map, and the
+  // two are told apart by height: a cascade map fills 2048 rows, a screen buffer is shorter.
+  // Keying on colour-vs-depth instead split a PAIR: the 640x864 colour was scaled while the
+  // 640x864 depth bound with it was not, and a depth test across that pair lands between pixels
+  // (log shd_175). Colour and depth of one size must answer the same.
+  // The whole 640 pitch, colour and depth together. It carries the engine's half-screen buffers
+  // (ambient occlusion, AuxColor's half copy) and a shadow cascade map, and the two cannot be
+  // told apart by height -- AuxColor's 640x360 copy lives in a target allocated to 2048 rows, the
+  // same as a cascade map (log shd_180). Scaling the pitch as a whole keeps every pass's colour
+  // and depth at one scale, which is what the depth test needs; the cascade map at that pitch
+  // scales with it, and its cascades are sampled as fractions, so they follow.
+  // The screen and every step of the chain the engine derives from it: 1280 (scene), 640 (half:
+  // ambient occlusion, AuxColor's copy), 320 (quarter: the blur and bloom steps, 320x184 of a
+  // 1280x720 screen). Measured in the final frame (cap2_r07): the seam sat at x=319, y=359 of a
+  // 640x368 image -- exactly where a quarter-size step that kept the guest size would end.
+  // shd_scale_pitches: bit 0 = 1280, bit 1 = 1040, bit 2 = 640, bit 3 = 320. Lets the console
+  // test which pitch carries the quadrant copy without a rebuild (default 15 = all four).
+  const uint32_t pitch_mask = REXCVAR_GET(shd_scale_pitches);
+  const bool half_screen = (key.pitch == 640 && (pitch_mask & 4)) ||
+                           (key.pitch == 320 && (pitch_mask & 8));
+  // AuxColor is the engine's scratch copy of the screen: 1024x720 drawn into a 1040-pitch target,
+  // composited back over the frame. At the guest size next to a halved scene it covered a corner
+  // of the frame -- the rectangle with the silhouette, in the menu and in the game (log shd_173).
+  const bool aux_screen = key.pitch == 1040 && (pitch_mask & 2);
+  const bool screen_pitch = (key.pitch == 1280 && (pitch_mask & 1)) || half_screen || aux_screen;
+  rt->scale_q = screen_pitch ? shd::render_scale::WantedQuarters() : shd::render_scale::kNative;
+  // What the scale actually produces, per target: the first targets of a session, with their
+  // guest and host sizes side by side. A host size that is not what the arithmetic promises, or
+  // two targets of one pass with different host heights, names the bug instead of guessing at it.
+  if (shd::render_scale::Enabled()) {
+    static uint32_t reported = 0;
+    if (reported < 20) {
+      ++reported;
+      if (ShdDiagScaleOn()) REXLOG_INFO("[shd-scale] target {} {}x{} guest -> {}x{} host (pitch {}, fmt {}, msaa {})",
+                  key.is_depth ? "depth" : "color", rt->width, rt->height,
+                  shd::render_scale::ScaleSize(rt->width, rt->scale_q),
+                  shd::render_scale::ScaleSize(rt->height, rt->scale_q), key.pitch, key.format,
+                  key.msaa);
+    }
+  }
+  info.extent = {shd::render_scale::ScaleSize(rt->width, rt->scale_q),
+                 shd::render_scale::ScaleSize(rt->height, rt->scale_q), 1};
   info.mipLevels = 1;
   info.arrayLayers = 1;
   info.samples = rt->samples;
@@ -5076,7 +5307,17 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     VkImageCopy copy = {};
     copy.srcSubresource = {aspect, 0, 0, 1};
     copy.dstSubresource = copy.srcSubresource;
-    copy.extent = {std::min(old->width, rt->width), old->height, 1};
+    // Host pixels: both images are their guest size scaled, and a copy names host extents. With
+    // the two at the same scale (always, within a session) this is the guest extent scaled once.
+    // Both images must be at the same scale for a copy: a target recreated taller keeps the
+    // scale of the session, so they always are, but if that ever changes the copy would move the
+    // old contents to the wrong pixels rather than fail visibly.
+    if (old->scale_q != rt->scale_q) {
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] target recreated at another scale ({}/4 -> {}/4): contents dropped",
+                  old->scale_q, rt->scale_q);
+    }
+    copy.extent = {shd::render_scale::ScaleSize(std::min(old->width, rt->width), rt->scale_q),
+                   shd::render_scale::ScaleSize(old->height, rt->scale_q), 1};
     VkMemoryBarrier memory_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                       VK_ACCESS_TRANSFER_WRITE_BIT |
                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
@@ -5159,9 +5400,63 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
   if (width == UINT32_MAX) {
     return false;
   }
+  // Guest size in, host size out: the attachments are q/4 of the guest size, so the area the pass
+  // covers must be too, or the scaled image is drawn into a corner of itself.
+  // The pass runs at the scale its attachments actually have, which is the scale of the first one
+  // bound: a colour target and a depth target of different scales (a scaled screen colour with the
+  // unscaled shadow atlas) cannot both be right, and the area below is clamped to the smaller.
+  {
+    // Every attachment of this pass must have the same host size, so the pass runs at the scale
+    // they all share: if any of them is unscaled (the shadow atlas, an engine buffer), the whole
+    // pass is. The area below is in host pixels of that scale.
+    // The colour decides: it is the screen, and the area is in its pixels. A depth attachment of
+    // another scale (the shadow atlas, bound with a scaled screen colour) is not a reason to drop
+    // the whole pass to the guest size -- that was what drew the frame at the wrong scale.
+    const RenderTarget* first_color = nullptr;
+    for (uint32_t i = 0; i < 4 && !first_color; ++i) first_color = targets.color[i];
+    pass_scale_q = first_color ? first_color->scale_q
+                   : targets.depth ? targets.depth->scale_q
+                                   : shd::render_scale::WantedQuarters();
+    // Every attachment must agree, not just the first: a pass bound to two colour targets of
+    // different scales drew half its area at one scale and half at the other, which came out as a
+    // seam down the middle of the scene with the two sides an exponent apart (cap1_r07: 1.11 left,
+    // 2.11 right). Where they disagree the pass runs at the guest size, which is always valid.
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (targets.color[i] && targets.color[i]->scale_q != pass_scale_q) {
+        if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] pass attachments disagree: colour {} is {}/4, the pass is {}/4",
+                    i, targets.color[i]->scale_q, pass_scale_q);
+        pass_scale_q = shd::render_scale::kNative;
+        break;
+      }
+    }
+    // A scaled attachment in a pass that must run unscaled would be drawn into a corner of a
+    // full-size area: the renderer draws it at its own size instead, which is what the clamp of
+    // width and height to the smallest attachment already arranges.
+  }
+  const uint32_t host_width = shd::render_scale::ScaleSize(width, pass_scale_q);
+  const uint32_t host_height = shd::render_scale::ScaleSize(height, pass_scale_q);
+  // Do the attachments of this pass agree? A colour and a depth of different host sizes is the
+  // depth test landing between pixels, which is what noise along every edge looks like.
+  if (shd::render_scale::Enabled()) {
+    static uint32_t reported = 0;
+    const RenderTarget* first_color = nullptr;
+    for (uint32_t i = 0; i < 4 && !first_color; ++i) first_color = targets.color[i];
+    // Only a difference in SCALE is a defect. Different heights are normal: a 736-row colour is
+    // bound with the 2048-row shadow atlas and the pass draws into the first rows of both, as the
+    // guest does. Comparing full heights reported a mismatch on every frame of a correct pass.
+    if (first_color && targets.depth && reported < 12 &&
+        first_color->scale_q != targets.depth->scale_q) {
+      ++reported;
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] MISMATCH in a pass: colour {}x{} host, depth {}x{} host "
+                  "(guest {}x{} and {}x{})",
+                  first_color->HostWidth(), first_color->HostHeight(),
+                  targets.depth->HostWidth(), targets.depth->HostHeight(), first_color->width,
+                  first_color->height, targets.depth->width, targets.depth->height);
+    }
+  }
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea.extent = {width, height};
+  info.renderArea.extent = {host_width, host_height};
   info.layerCount = 1;
   info.colorAttachmentCount = color_count;
   info.pColorAttachments = colors;
@@ -5170,6 +5465,8 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
       targets.depth && HasStencil(targets.depth->format) ? &depth : nullptr;
   dfn().vkCmdBeginRendering(cmd(), &info);
   in_pass = true;
+  // The guest extent: the scissor and the viewport are clamped against it in guest coordinates and
+  // converted to host ones at the command, so the clamping rule stays exactly what it was.
   pass_extent = {width, height};
   ++stats().render_passes;
   return true;
@@ -6918,16 +7215,46 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
 
   // Dynamic state.
-  if (std::memcmp(&st.vp, &bound_viewport, sizeof(st.vp))) {
-    d.flags |= kDrawViewport;
-    d.viewport = st.vp;
-    bound_viewport = st.vp;
+  // The viewport is in guest pixels and the attachments are q/4 of that: scaled by edges, as the
+  // scissor is, so a viewport and the scissor that bounds it keep agreeing to the pixel.
+  VkViewport vp = st.vp;
+  if (pass_scale_q != shd::render_scale::kNative) {
+    const float f = float(pass_scale_q) / float(shd::render_scale::kNative);
+    vp.x *= f;
+    vp.y *= f;
+    vp.width *= f;
+    vp.height *= f;
   }
+  // What a scaled draw is really given, once per distinct (guest viewport, pass scale): the
+  // quadrant copy of the scene means one of these is halved twice, and the numbers say which.
+  if (pass_scale_q != shd::render_scale::kNative) {
+    static std::set<uint64_t> seen_vp;
+    const uint64_t vk = (uint64_t(uint32_t(st.vp.width)) << 40) |
+                        (uint64_t(uint32_t(st.vp.height)) << 20) | (uint64_t(pass_extent.width) << 4) |
+                        pass_scale_q;
+    if (seen_vp.size() < 24 && seen_vp.insert(vk).second) {
+      const RenderTarget* c0 = st.targets.color[0];
+      if (ShdDiagScaleOn()) REXLOG_INFO("[shd-vp] guest vp {}x{} at {},{} -> host vp {}x{} at {},{} | pass guest {}x{} "
+                  "scale {}/4 | colour0 guest {}x{} host {}x{} | ndc {} {}",
+                  st.vp.width, st.vp.height, st.vp.x, st.vp.y, vp.width, vp.height, vp.x, vp.y,
+                  pass_extent.width, pass_extent.height, pass_scale_q, c0 ? c0->width : 0,
+                  c0 ? c0->height : 0, c0 ? c0->HostWidth() : 0, c0 ? c0->HostHeight() : 0,
+                  st.viewport.ndc_scale[0], st.viewport.ndc_scale[1]);
+    }
+  }
+  if (std::memcmp(&vp, &bound_viewport, sizeof(vp))) {
+    d.flags |= kDrawViewport;
+    d.viewport = vp;
+    bound_viewport = vp;
+  }
+  // Clamped in guest coordinates against the guest extent (the rule the renderer always had),
+  // then converted to host pixels by edges.
   VkRect2D sr;
   sr.offset.x = int32_t(std::min(st.scissor.offset[0], pass_extent.width));
   sr.offset.y = int32_t(std::min(st.scissor.offset[1], pass_extent.height));
   sr.extent.width = std::min(st.scissor.extent[0], pass_extent.width - uint32_t(sr.offset.x));
   sr.extent.height = std::min(st.scissor.extent[1], pass_extent.height - uint32_t(sr.offset.y));
+  sr = shd::render_scale::ScaleRect(sr, pass_scale_q);
   if (std::memcmp(&sr, &bound_scissor, sizeof(sr))) {
     d.flags |= kDrawScissor;
     d.scissor = sr;
@@ -7146,8 +7473,11 @@ void Renderer::Impl::Resolve() {
   // so the frame's passes can be looked at in order (logs/capN_rNN_*.bin, raw host texels).
   if (capture_all && WaterSimTracing() && !is_depth && capture_resolve_dumps < 80) {
     ++capture_resolve_dumps;
-    RecordImageDump(source->image, source->format, std::min(source->width, 1280u),
-                    std::min(source->height, 736u),
+    // Host size: the image is the guest size scaled, and a dump reading guest extents out of a
+    // smaller image gave files that looked like a half-written mask (cap6_r06 all 255, r12 all 0)
+    // and sent the hunt after a defect the renderer did not have.
+    RecordImageDump(source->image, source->format, std::min(source->HostWidth(), 1280u),
+                    std::min(source->HostHeight(), 736u),
                     fmt::format("cap{}_r{:02}_fmt{}_b{}_rect{}x{}_to{:08X}_tex{}_exp{}", capture_count,
                                 capture_resolve_dumps, source_key.format, source_key.base_tiles,
                                 x1 - x0, y1 - y0,
@@ -7423,8 +7753,18 @@ void Renderer::Impl::Resolve() {
           if (!set && resolve_probe_enabled) probe_path = 8;
           if (set) {
             probe_path = 2;
+            // The guest wants the depth of its own pixels, so a target drawn at q/4 is read from a
+            // full-size copy. This route was the one that still read the halved image with guest
+            // coordinates: the scene's depth (14F68000, sampled by the post effects 94 times a
+            // frame) came out as its own top-left quarter stretched over the screen -- the dark
+            // copy of the character, the trees and the rocks.
+            VkImageView depth_view = source->sample_view;
+            if (source->scale_q != shd::render_scale::kNative) {
+              VkImageView full = VK_NULL_HANDLE;
+              if (DepthFullSize(c, *source, &full) != VK_NULL_HANDLE && full) depth_view = full;
+            }
             VkDescriptorImageInfo images[2] = {
-                {VK_NULL_HANDLE, source->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, depth_view, VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, atlas ? atlas->storage_view : dest->view,
                  VK_IMAGE_LAYOUT_GENERAL}};
             VkWriteDescriptorSet writes[2] = {};
@@ -7479,7 +7819,13 @@ void Renderer::Impl::Resolve() {
           regions[1] = regions[0];
           regions[1].bufferOffset = stencil_offset;
           regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-          dfn().vkCmdCopyImageToBuffer(c, source->image, VK_IMAGE_LAYOUT_GENERAL, depth_scratch,
+          // The guest wants the depth of its own pixels: read from the full-size image when
+          // this target was drawn smaller (shd_render_width).
+          const VkImage depth_source = DepthFullSize(c, *source);
+          if (depth_source == VK_NULL_HANDLE) {
+            probe_path = 7;
+          } else {
+          dfn().vkCmdCopyImageToBuffer(c, depth_source, VK_IMAGE_LAYOUT_GENERAL, depth_scratch,
                                        has_stencil ? 2 : 1, regions);
           VkMemoryBarrier to_compute = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                         VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -7524,6 +7870,7 @@ void Renderer::Impl::Resolve() {
               textures.CopyToSized(*words, c);
             }
           }
+          }
         } else {
           probe_path = 7;
           static bool logged = false;
@@ -7532,6 +7879,33 @@ void Renderer::Impl::Resolve() {
             REXLOG_WARN("[native] Depth resolve not done: {}x{}, {}x MSAA", width, height,
                         1u << msaa);
           }
+        }
+      } else if (source->scale_q != shd::render_scale::kNative && resolve_scale == 1.0f &&
+                 resolve_clamp == 0 &&
+                 BlitScaledResolve(c, *source, *dest, x0, y0, width, height, sample_x,
+                                   sample_y)) {
+        // Only when the copy carries no exponent bias and no range clamp. A blit moves texels and
+        // cannot scale their values, and the scene of this game is resolved with a bias: copied
+        // unscaled it comes out white, which is why the loading screen (a flat image, no bias)
+        // looked right while the menu and the forest were blown out. With a bias the staged route
+        // below does the stretch and leaves the scaling to the compute copy, which knows how.
+        // The source target was rendered at q/4 of the guest size and the destination is a guest
+        // texture the game reads back by address and size, so it keeps the guest size: the copy
+        // has to stretch. The compute path below addresses both images in the same coordinates
+        // and would leave the smaller picture in the corner of a full-size texture.
+        probe_path = 10;
+      } else if (source->scale_q != shd::render_scale::kNative) {
+        // The blit above could not take this pair (formats a blit cannot convert between, a
+        // destination without TRANSFER_DST). Copying the scaled source with the compute path
+        // would put the small picture in a corner of the guest-size texture -- the black half of
+        // the menu. Draw it instead: a fragment pass samples the source with a filter, so it
+        // stretches, and it converts formats on the way.
+        probe_path = 11;
+        // The fragment copy samples by texel, so it cannot stretch either: fall back to a blit
+        // through a staging image of the guest size, which can.
+        if (!BlitScaledResolveStaged(c, *source, *dest, x0, y0, width, height, resolve_scale,
+                                     resolve_clamp, sample_x, sample_y)) {
+          probe_path = 12;  // nothing could copy it: better untouched than wrong
         }
       } else if (!msaa && textures.StorageCapable(dest->format) &&
                  ComputeColorCopy(c, source->view, dest->view, x0, y0, x0, y0, width, height,
@@ -7594,6 +7968,37 @@ void Renderer::Impl::Resolve() {
         RecordImageDump(dest->image, dest->format, dest->width, dest->height,
                         fmt::format("cap{}_edge_out_{:08X}", capture_count,
                                     dest_base & 0x1FFFFFFF));
+      }
+    }
+    // How the scaled resolves actually went (not under resolve_probe_enabled: that diagnostic is
+    // off, which is why this counted nothing). Path 10 is the direct blit, 11 the staged one, 12 a
+    // pair nothing could copy, 1-6 the unscaled paths -- those put a small picture in the corner
+    // of a guest-size texture, which is the cut-off figure in the forest.
+    if (shd::render_scale::Enabled()) {
+      if (probe_path == 10) ++scaled_resolve_direct;
+      else if (probe_path == 11) ++scaled_resolve_staged;
+      else if (probe_path == 12) ++scaled_resolve_failed;
+      // Colour paths only: 2, 3, 7, 8 and 9 are the depth routes, which go through the full-size
+      // scratch and are right as they are. 1, 4, 5 and 6 are colour copied at the guest size --
+      // the small picture in a corner.
+      else if (probe_path == 1 || probe_path == 4 || probe_path == 5 || probe_path == 6) {
+        ++scaled_resolve_plain;
+        // One line per distinct (source size, requested rectangle): the first ten hid the rest,
+        // and the frames with twenty-odd unscaled copies never showed what they were.
+        static std::set<uint64_t> named;
+        const uint64_t what = (uint64_t(source->HostWidth()) << 48) |
+                              (uint64_t(source->HostHeight()) << 32) |
+                              (uint64_t(width) << 16) | height;
+        if (named.size() < 64 && named.insert(what).second) {
+          if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] unscaled colour resolve: source {}x{} host (scale {}/4), "
+                      "asked {}x{} at {},{}",
+                      source->HostWidth(), source->HostHeight(), source->scale_q, width, height,
+                      x0, y0);
+          if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] unscaled colour resolve by path {}: {}x{} from format {} to {} "
+                      "(scale {}, clamp {}, msaa {})",
+                      probe_path, width, height, uint32_t(source->format), uint32_t(dest_format),
+                      resolve_scale, resolve_clamp, msaa);
+        }
       }
     }
     if (resolve_probe_enabled) {
@@ -7737,6 +8142,309 @@ void Renderer::Impl::Resolve() {
   // the next rendering or present, so a run of resolves shares one (each
   // barrier is a full wait for idle on this GPU).
   resolve_barrier_pending = true;
+}
+
+// Copies a render target drawn at q/4 of the guest size into a full-size guest texture, stretching
+// as it goes (shd_render_width). Everything the guest sees keeps its own size; only this one copy
+// knows that the source is smaller. Returns false when the device cannot blit the pair, and the
+// caller falls back to its usual paths.
+bool Renderer::Impl::BlitScaledResolve(VkCommandBuffer c, const RenderTarget& source,
+                                       const ResolveDestination& dest, int32_t x0, int32_t y0,
+                                       uint32_t width, uint32_t height, uint32_t sample_x,
+                                       uint32_t sample_y) {
+  if (!Extra(device).vkCmdBlitImage || source.image == VK_NULL_HANDLE ||
+      dest.image == VK_NULL_HANDLE || !width || !height) {
+    return false;
+  }
+  if (source.samples != VK_SAMPLE_COUNT_1_BIT) {
+    return false;
+  }
+  const uint32_t q = source.scale_q;
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.dstSubresource = blit.srcSubresource;
+  // Source in host pixels (edges, so the rectangles tile exactly), destination in guest ones.
+  // The target may be drawn with its samples as pixels (SampleScaleX/Y: a 2x2 MSAA surface is a
+  // target twice as wide and tall): the resolve rectangle is in guest pixels, the source holds
+  // sample_x * sample_y texels per pixel. Without the factor the blit read only the top-left
+  // quarter of the source and stretched it over the whole rectangle -- the frame repeated in the
+  // top-left corner (capture 2 of shd_191, step r03: msaa 2, sample 2x2). A linear blit over a
+  // 2x2 block averages the samples, as the guest resolve does.
+  const int32_t smx = int32_t(sample_x), smy = int32_t(sample_y);
+  blit.srcOffsets[0] = {shd::render_scale::ScaleEdge(x0 * smx, q),
+                        shd::render_scale::ScaleEdge(y0 * smy, q), 0};
+  blit.srcOffsets[1] = {shd::render_scale::ScaleEdge((x0 + int32_t(width)) * smx, q),
+                        shd::render_scale::ScaleEdge((y0 + int32_t(height)) * smy, q), 1};
+  blit.dstOffsets[0] = {x0, y0, 0};
+  blit.dstOffsets[1] = {x0 + int32_t(width), y0 + int32_t(height), 1};
+  if (blit.srcOffsets[1].x <= blit.srcOffsets[0].x ||
+      blit.srcOffsets[1].y <= blit.srcOffsets[0].y) {
+    return false;
+  }
+  Extra(device).vkCmdBlitImage(c, source.image, VK_IMAGE_LAYOUT_GENERAL, dest.image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    if (ShdDiagScaleOn()) REXLOG_INFO("[shd-quality] scaled resolve: {}x{} host -> {}x{} guest",
+                blit.srcOffsets[1].x - blit.srcOffsets[0].x,
+                blit.srcOffsets[1].y - blit.srcOffsets[0].y, width, height);
+  }
+  return true;
+}
+
+// A depth target drawn at q/4 cannot be read back texel by texel: the guest wants the depth of
+// every one of its own pixels and the scaled image simply does not have them. This blits the
+// scaled depth into a full-size scratch image, which the texel-wise routes then read as they
+// always did. Returns the image to read (the target's own when nothing is scaled), or NULL when
+// the scratch could not be made and the caller should skip the resolve rather than write wrong
+// bits into guest memory.
+VkImage Renderer::Impl::DepthFullSize(VkCommandBuffer c, const RenderTarget& source,
+                                      VkImageView* view_out) {
+  if (source.scale_q == shd::render_scale::kNative) {
+    if (view_out) *view_out = source.sample_view;
+    return source.image;
+  }
+  if (!Extra(device).vkCmdBlitImage) {
+    return VK_NULL_HANDLE;
+  }
+  // One scratch per size, kept for the session: these resolves happen every frame.
+  const uint64_t key = (uint64_t(source.width) << 32) | source.height;
+  auto it = depth_fullsize.find(key);
+  if (it == depth_fullsize.end()) {
+    DepthFullSizeImage fresh;
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = source.format;
+    info.extent = {source.width, source.height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dfn().vkCreateImage(vk, &info, nullptr, &fresh.image) != VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    VkMemoryRequirements requirements = {};
+    dfn().vkGetImageMemoryRequirements(vk, fresh.image, &requirements);
+    uint32_t type = 0;
+    if (!rex::bit_scan_forward(requirements.memoryTypeBits & device->memory_types().device_local,
+                               &type)) {
+      dfn().vkDestroyImage(vk, fresh.image, nullptr);
+      return VK_NULL_HANDLE;
+    }
+    VkMemoryAllocateInfo allocate = {};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    if (dfn().vkAllocateMemory(vk, &allocate, nullptr, &fresh.memory) != VK_SUCCESS ||
+        dfn().vkBindImageMemory(vk, fresh.image, fresh.memory, 0) != VK_SUCCESS) {
+      if (fresh.memory) dfn().vkFreeMemory(vk, fresh.memory, nullptr);
+      dfn().vkDestroyImage(vk, fresh.image, nullptr);
+      return VK_NULL_HANDLE;
+    }
+    // A depth-only view, for the compute route that reads depth texel by texel (sample_view).
+    VkImageViewCreateInfo dv = {};
+    dv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    dv.image = fresh.image;
+    dv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    dv.format = source.format;
+    dv.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (dfn().vkCreateImageView(vk, &dv, nullptr, &fresh.view) != VK_SUCCESS) {
+      fresh.view = VK_NULL_HANDLE;
+    }
+    if (ShdDiagScaleOn()) REXLOG_INFO("[shd-quality] full-size depth scratch {}x{} for the texel-wise resolves",
+                source.width, source.height);
+    it = depth_fullsize.emplace(key, fresh).first;
+  }
+  // Into GENERAL once; it stays there, as the renderer's other images do.
+  VkImageMemoryBarrier to_general = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_general.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  to_general.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_general.oldLayout = it->second.prepared ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_general.image = it->second.image;
+  to_general.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+  if (HasStencil(source.format)) {
+    to_general.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+  }
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_general);
+  it->second.prepared = true;
+  // NEAREST: depth is not a colour, an averaged depth is a depth no surface has.
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.srcOffsets[1] = {int32_t(source.HostWidth()), int32_t(source.HostHeight()), 1};
+  blit.dstOffsets[1] = {int32_t(source.width), int32_t(source.height), 1};
+  Extra(device).vkCmdBlitImage(c, source.image, VK_IMAGE_LAYOUT_GENERAL, it->second.image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+  VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &after, 0, nullptr, 0, nullptr);
+  if (view_out) *view_out = it->second.view;
+  return it->second.image;
+}
+
+// The scaled source stretched into a guest-size staging image of the SOURCE's format (which a
+// blit can always do), and then copied to the destination by the usual compute path (which can
+// convert formats, but not sizes). Between them they do what neither does alone.
+bool Renderer::Impl::BlitScaledResolveStaged(VkCommandBuffer c, const RenderTarget& source,
+                                             ResolveDestination& dest, int32_t x0, int32_t y0,
+                                             uint32_t width, uint32_t height, float resolve_scale,
+                                             uint32_t resolve_clamp, uint32_t sample_x,
+                                             uint32_t sample_y) {
+  if (!Extra(device).vkCmdBlitImage || !width || !height) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve refused at the entry: blit {}, {}x{}",
+                  Extra(device).vkCmdBlitImage ? "yes" : "NO", width, height);
+    }
+    if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve failed: image");
+    return false;
+  }
+  // Sized by the DESTINATION, not the source target: a 1280x1344 depth target resolves a
+  // 1280x720 rectangle, and a staging image of the target's own height left the compute copy
+  // reading rows the resolve never wrote -- the stretched-too-far head in the corner.
+  // Sized by what the copy writes, in guest pixels, and never smaller than the rectangle itself:
+  // callers pass the guest size of the request, so x0 + width is the right extent for both the
+  // whole-screen case and a sub-rectangle of an engine buffer.
+  const uint32_t staging_width = std::max<uint32_t>(uint32_t(x0) + width, 1u);
+  const uint32_t staging_height = std::max<uint32_t>(uint32_t(y0) + height, 1u);
+  // The source must actually be smaller than what is being written, or there is nothing to
+  // stretch and the staging image only costs memory.
+  // Nothing to stretch only when the SOURCE RECTANGLE is already the size being written: comparing
+  // the whole source image against the rectangle refused every sub-rectangle copy (a 128x128 piece
+  // of a 640x672 target), and those fell back to the plain path, which left the small picture in
+  // a corner of the guest-size texture.
+  if (source.scale_q == shd::render_scale::kNative) {
+    return false;
+  }
+  const uint64_t key = (uint64_t(source.format) << 40) | (uint64_t(staging_width) << 20) |
+                       staging_height;
+  auto it = scale_staging.find(key);
+  if (it == scale_staging.end()) {
+    DepthFullSizeImage fresh;
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = source.format;
+    info.extent = {staging_width, staging_height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    if (dfn().vkCreateImage(vk, &info, nullptr, &fresh.image) != VK_SUCCESS) {
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve failed: allocate or bind");
+      return false;
+    }
+    VkMemoryRequirements requirements = {};
+    dfn().vkGetImageMemoryRequirements(vk, fresh.image, &requirements);
+    uint32_t type = 0;
+    if (!rex::bit_scan_forward(requirements.memoryTypeBits & device->memory_types().device_local,
+                               &type)) {
+      dfn().vkDestroyImage(vk, fresh.image, nullptr);
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve failed: view");
+      return false;
+    }
+    VkMemoryAllocateInfo allocate = {};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    if (dfn().vkAllocateMemory(vk, &allocate, nullptr, &fresh.memory) != VK_SUCCESS ||
+        dfn().vkBindImageMemory(vk, fresh.image, fresh.memory, 0) != VK_SUCCESS) {
+      if (fresh.memory) dfn().vkFreeMemory(vk, fresh.memory, nullptr);
+      dfn().vkDestroyImage(vk, fresh.image, nullptr);
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve failed: degenerate rect");
+      return false;
+    }
+    VkImageViewCreateInfo view = {};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = fresh.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = source.format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn().vkCreateImageView(vk, &view, nullptr, &fresh.view) != VK_SUCCESS) {
+      dfn().vkFreeMemory(vk, fresh.memory, nullptr);
+      dfn().vkDestroyImage(vk, fresh.image, nullptr);
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve failed: blit");
+      return false;
+    }
+    if (ShdDiagScaleOn()) REXLOG_INFO("[shd-quality] staging {}x{} for scaled resolves of format {}", staging_width,
+                staging_height, uint32_t(source.format));
+    it = scale_staging.emplace(key, fresh).first;
+  }
+  VkImageMemoryBarrier to_general = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  to_general.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_general.oldLayout = it->second.prepared ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_general.image = it->second.image;
+  to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_general);
+  it->second.prepared = true;
+  const uint32_t q = source.scale_q;
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.dstSubresource = blit.srcSubresource;
+  // The target may be drawn with its samples as pixels (SampleScaleX/Y: a 2x2 MSAA surface is a
+  // target twice as wide and tall): the resolve rectangle is in guest pixels, the source holds
+  // sample_x * sample_y texels per pixel. Without the factor the blit read only the top-left
+  // quarter of the source and stretched it over the whole rectangle -- the frame repeated in the
+  // top-left corner (capture 2 of shd_191, step r03: msaa 2, sample 2x2). A linear blit over a
+  // 2x2 block averages the samples, as the guest resolve does.
+  const int32_t smx = int32_t(sample_x), smy = int32_t(sample_y);
+  blit.srcOffsets[0] = {shd::render_scale::ScaleEdge(x0 * smx, q),
+                        shd::render_scale::ScaleEdge(y0 * smy, q), 0};
+  blit.srcOffsets[1] = {shd::render_scale::ScaleEdge((x0 + int32_t(width)) * smx, q),
+                        shd::render_scale::ScaleEdge((y0 + int32_t(height)) * smy, q), 1};
+  blit.dstOffsets[0] = {x0, y0, 0};
+  blit.dstOffsets[1] = {x0 + int32_t(width), y0 + int32_t(height), 1};
+  if (blit.srcOffsets[1].x <= blit.srcOffsets[0].x ||
+      blit.srcOffsets[1].y <= blit.srcOffsets[0].y) {
+    return false;
+  }
+  Extra(device).vkCmdBlitImage(c, source.image, VK_IMAGE_LAYOUT_GENERAL, it->second.image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+  VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &after, 0, nullptr, 0, nullptr);
+  // Now both are the guest size: the usual compute copy finishes the job, format conversion and
+  // all, in the coordinates it has always used.
+  // The staging image holds the stretched picture at the guest size; the compute copy applies the
+  // resolve's exponent bias and range clamp, as it does for every unscaled resolve.
+  const bool copied = ComputeColorCopy(c, it->second.view, dest.view, x0, y0, x0, y0, width,
+                                       height, 1, 1, resolve_scale, resolve_clamp,
+                                       textures.ColorAttachmentCapable(dest.format)
+                                           ? dest.format
+                                           : VK_FORMAT_UNDEFINED);
+  if (!copied) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] staged resolve: the compute copy refused {}x{} to format {}", width,
+                  height, uint32_t(dest.format));
+    }
+  }
+  return copied;
 }
 
 void Renderer::Impl::FlushResolveBarrier() {
@@ -7972,13 +8680,30 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   at_last_swap.textures_uploaded = textures.stats().uploads;
   // Save the driver's pipeline cache once new pipelines stop appearing for a
   // while, off this thread: the file is tens of megabytes on the SD card.
+  // Saved once no pipeline has been built for a moment (a level loaded, a cutscene playing), or
+  // every half minute regardless: a session that keeps meeting new materials never goes quiet, and
+  // used to reach its end having written nothing (log shd_143). The write itself is off this
+  // thread; the file is tens of megabytes on the SD card.
+  const bool cache_quiet = now - last_pipeline_time > std::chrono::seconds(3);
+  const bool cache_overdue = now - last_cache_save > std::chrono::seconds(30);
   if (!driver_cache_path.empty() && stats().pipelines_created != pipelines_at_last_save &&
-      now - last_pipeline_time > std::chrono::seconds(5) && !driver_cache_writing.load()) {
+      (cache_quiet || cache_overdue) && !driver_cache_writing.load()) {
     SaveDriverCache();
+    last_cache_save = now;
+  }
+  if (ShdDiagScaleOn() && shd::render_scale::Enabled() &&
+      (scaled_resolve_direct || scaled_resolve_staged || scaled_resolve_failed ||
+       scaled_resolve_plain)) {
+    if (ShdDiagScaleOn()) REXLOG_INFO("[shd-scale] resolves: {} blit, {} staged, {} FAILED, {} unscaled path",
+                scaled_resolve_direct, scaled_resolve_staged, scaled_resolve_failed,
+                scaled_resolve_plain);
+    scaled_resolve_direct = scaled_resolve_staged = scaled_resolve_failed =
+        scaled_resolve_plain = 0;
   }
   if (prewarm_enabled && !prewarm_path.empty() && prewarm_keys.size() != prewarm_saved_keys &&
-      now - last_pipeline_time > std::chrono::seconds(5) && !prewarm_writing.load()) {
+      (cache_quiet || cache_overdue) && !prewarm_writing.load()) {
     SavePrewarm();
+    last_cache_save = now;
   }
   stats().textures_uploaded = textures.stats().uploads;
   stats().texture_bytes_uploaded = textures.stats().upload_bytes;
@@ -8216,8 +8941,12 @@ void Renderer::Impl::LoadPrewarm(const std::filesystem::path& directory, uint32_
     for (uint32_t i = 0; i < key_count && prewarm_keys.size() < kPrewarmMaxKeys; ++i) {
       PipelineKey key;
       std::memcpy(&key, payload.data() + offset + size_t(i) * sizeof(PipelineKey), sizeof(key));
-      if (prewarm_key_hashes.insert(XXH3_64bits(&key, sizeof(key))).second) {
+      const uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
+      if (prewarm_key_hashes.insert(key_hash).second) {
         prewarm_keys.push_back(key);
+        // What came from the file, as opposed to what this session records as it draws: only these
+        // keys were given to the prewarm thread, so only they can say whether it helped.
+        prewarm_loaded_hashes.insert(key_hash);
       }
     }
   } else {
@@ -8280,6 +9009,12 @@ void Renderer::Impl::SavePrewarm() {
     bool written = false;
     if (FILE* file = rex::filesystem::OpenFile(temporary, "wb")) {
       written = fwrite(data->data(), data->size(), 1, file) == 1;
+      // As the driver cache: fsync before the rename, or a HOME exit loses the list and the next
+      // start has nothing to prewarm from.
+      if (written) {
+        std::fflush(file);
+        fsync(fileno(file));
+      }
       if (fclose(file) != 0) written = false;
       if (written) {
         std::error_code error;
@@ -8296,8 +9031,12 @@ void Renderer::Impl::SavePrewarm() {
 void Renderer::Impl::SaveDriverCache() {
   pipelines_at_last_save = stats().pipelines_created;
   size_t size = 0;
+  // Not "the blob grew": a driver may return the same size with different contents (NVK packs its
+  // entries), and then a session that compiled 90 pipelines saved nothing at all because the byte
+  // count happened to match (log shd_144). The caller already checked that new pipelines were
+  // built; that is what decides, not the size.
   if (Extra(device).vkGetPipelineCacheData(vk, driver_cache, &size, nullptr) != VK_SUCCESS ||
-      size < 32 || size == driver_cache_saved_size) {
+      size < 32) {
     return;
   }
   auto data = std::make_shared<std::vector<uint8_t>>(size);
@@ -8306,6 +9045,8 @@ void Renderer::Impl::SaveDriverCache() {
   }
   data->resize(size);
   driver_cache_saved_size = size;
+  REXLOG_INFO("[native] driver cache: writing {} KB ({} pipelines built since the last write)",
+              size >> 10, stats().pipelines_created - pipelines_at_last_save);
   driver_cache_writing = true;
   std::filesystem::path path = driver_cache_path;
   // Joined, never detached: detaching throws on Horizon, which ended the game.
@@ -8321,6 +9062,14 @@ void Renderer::Impl::SaveDriverCache() {
                                  XXH3_64bits(data->data(), data->size())};
       bool written = fwrite(header, sizeof(header), 1, file) == 1 &&
                      fwrite(data->data(), data->size(), 1, file) == 1;
+      // Flushed is not written: the bytes only reach the file system service, which may still hold
+      // them. A game closed with HOME (the usual way) lost the session's compiled pipelines, and
+      // the next start compiled them all again. fsync before the rename, so the file the rename
+      // publishes is really on the card.
+      if (written) {
+        std::fflush(file);
+        fsync(fileno(file));
+      }
       if (fclose(file) != 0) written = false;
       if (written) {
         std::error_code error;

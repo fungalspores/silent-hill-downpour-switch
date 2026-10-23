@@ -29,7 +29,7 @@ p2_native_async_present = false
 present_effect = "fsr"
 
 # Threads and cores. The NSP forwarder allows cores 0-3, so the game gets the fourth core too (mask 15) and
-# audio sits on core 3, as Prototype 2 does. Settings screen: "Четвёртое ядро" -> 7 = cores 0-2 only.
+# audio sits on core 3, as Prototype 2 does. 7 = cores 0-2 only.
 p2_msr_lock_mode = 2
 p2_guest_priorities = false
 p2_guest_affinity = false
@@ -40,32 +40,19 @@ p2_guest_core_mask = 15
 p2_audio_core_mask = 8
 
 # Logs: warnings only.
-log_level = "info"
-log_flush_level = "info"
-p2_frame_diagnostics = false
-vulkan_validation_enabled = false
-shd_native_alpha_probe = false
+log_level = "warn"
+log_flush_level = "warn"
 
-# Diagnostics for the splash / video question (no image change)
-shd_diag_draw_targets = true
-shd_diag_draw_sequence = 12000
-shd_diag_draw_sequence_from = 300000
-shd_diag_draw_sequence_every = 0
-
-# Trace of draws (no image change)
-p2_diag_draw_sequence = 0
-p2_diag_draw_sequence_from = 0
-p2_diag_texture_first_use = false
 p2_native_exact_texture_check = true
-p2_diag_dump_texture = 0
-p2_diag_glyph_draws = false
-p2_diag_frame_dump_seconds = 0
-p2_native_capture_combo = false
 gpu_stacked_layer_bias = -1.0
-p2_diag_memexport = false
-p2_diag_empty_textures = false
-p2_diag_stale_textures = false
 p2_native_exact_texture_changed_only = false
 p2_native_max_mip_levels = 1
-p2_diag_untile_levels = false
 p2_native_recheck_empty_mips = false
+
+# Запросы видимости выключены, как в ПК-версии Downpour (иначе мигают персонажи).
+p2_native_occlusion_queries = false
+
+# Внутреннее разрешение: 640x360, 960x540 или 1280x720 (как в игре). Меньше = быстрее и холоднее.
+# Удобнее менять экраном настроек: + в первые 5 секунд после запуска с иконки. Требует перезапуска.
+shd_render_width = 960
+shd_render_height = 540
