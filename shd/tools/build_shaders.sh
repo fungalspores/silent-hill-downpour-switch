@@ -1,18 +1,26 @@
 #!/bin/sh
 # Silent Hill: Downpour — rebuild the shader library from the game files.
 #   sh tools/build_shaders.sh          full run (scan -> HLSL -> SPIR-V -> package), about 25 minutes
-# Output: shaders/lib/shd_shaders.mesp + .idx
+# Output: $R/shaders/lib/shd_shaders.mesp + .idx (copy both to sdmc:/switch/shd-nx/shaders/lib/).
+#   R      work folder with game/ (your extracted disc) inside; default: the shd folder of this repo
+#   ME     masseffect-nx at 650e14e with patches/masseffect-nx-xenosrecomp.patch applied
+#   REXSDK the patched SDK (for xxHash, fmt, libmspack)
+#   DXC    DXC built for the host (bin/dxc); spirv-val on PATH
 set -e
-R=/root/shd
-ME=$R/ref/masseffect-nx
-X=/root/proto/menx/sdk/thirdparty/xxHash
-F=/root/proto/menx/sdk/thirdparty/fmt/include
-M=/root/proto/menx/sdk/thirdparty/libmspack/libmspack/mspack
+T=$(cd "$(dirname "$0")" && pwd)
+R=${R:-$(dirname "$T")}
+: "${ME:?}" "${REXSDK:?}" "${DXC:?}"
+export DXC
+X=$REXSDK/thirdparty/xxHash
+F=$REXSDK/thirdparty/fmt/include
+M=$REXSDK/thirdparty/libmspack/libmspack/mspack
+mkdir -p $R/shaders $R/tools
+[ -f $R/shaders/shd_shader_common.h ] || cp $T/../shaders/shd_shader_common.h $R/shaders/
 
 echo "== tools"
 [ -x $R/tools/ue3_shader_scan ] || {
   gcc -O2 -c -I$M $M/lzxd.c -o /tmp/lzxd.o
-  g++ -std=c++20 -O2 -I$M $R/tools/ue3_shader_scan.cpp $R/tools/ue3_lzx.cpp /tmp/lzxd.o -o $R/tools/ue3_shader_scan
+  g++ -std=c++20 -O2 -I$M $T/ue3_shader_scan.cpp $T/ue3_lzx.cpp /tmp/lzxd.o -o $R/tools/ue3_shader_scan
 }
 [ -x $ME/out/tools/xenos_hlsl ] || (cd $ME && XXHASH_DIR=$X FMT_DIR=$F sh shaders/tools/build_xenos_hlsl.sh)
 [ -x $ME/out/tools/me_pack_shaders ] || g++ -std=c++20 -O2 -I$X \
@@ -31,7 +39,7 @@ $ME/out/tools/xenos_hlsl $R/shaders/containers $R/shaders/hlsl $R/shaders/shd_sh
 
 echo "== 3. SPIR-V (DXC built for aarch64 in tools/dxc-build)"
 rm -rf $R/shaders/spv && mkdir -p $R/shaders/spv
-ls $R/shaders/hlsl/*.hlsl | OUT=$R/shaders/spv xargs -n1 -P4 $R/tools/dxc_one.sh
+ls $R/shaders/hlsl/*.hlsl | OUT=$R/shaders/spv xargs -n1 -P4 $T/dxc_one.sh
 echo "compiled $(wc -l < $R/shaders/spv/ok.txt), failed $(cat $R/shaders/spv/cfail.txt $R/shaders/spv/valfail.txt 2>/dev/null | wc -l)"
 
 echo "== 4. package"

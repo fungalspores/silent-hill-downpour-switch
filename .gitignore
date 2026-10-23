@@ -1,8 +1,13 @@
 build/
+generated/
+out/
 *.nro
+*.nsp
+*.nacp
 *.elf
 *.mesp
 *.idx
 logs/
 game/
 *.log
+forwarder/loader/

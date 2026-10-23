@@ -1,0 +1,132 @@
+diff --git a/shaders/XenosRecomp/shader_recompiler.cpp b/shaders/XenosRecomp/shader_recompiler.cpp
+index 845c4b7..686055a 100644
+--- a/shaders/XenosRecomp/shader_recompiler.cpp
++++ b/shaders/XenosRecomp/shader_recompiler.cpp
+@@ -106,6 +106,16 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::TexCoord, 6, 14 },
+     { DeclUsage::TexCoord, 7, 15 },
+     { DeclUsage::Position, 1, 15 },
++    // SHD: Direct3D's own vertex shaders (linked by fetch register) fetch into r8..r15 as well. Give those
++    // registers locations of their own, so the "vertex fetch to a register >= r8" rejection is not needed.
++    { DeclUsage::TexCoord, 8, 16 },
++    { DeclUsage::TexCoord, 9, 17 },
++    { DeclUsage::TexCoord, 10, 18 },
++    { DeclUsage::TexCoord, 11, 19 },
++    { DeclUsage::TexCoord, 12, 20 },
++    { DeclUsage::TexCoord, 13, 21 },
++    { DeclUsage::TexCoord, 14, 22 },
++    { DeclUsage::TexCoord, 15, 23 },
+ };
+ 
+ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+@@ -511,11 +521,18 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                 }
+                 else
+                 {
+-                    if (relative)
+-                        throw std::runtime_error("relative addressing without a declared constant is pending");
+                     // MASSEFFECT: shaders without a constant table (Direct3D's own) read registers
+                     // that no name covers: straight from the constant buffer, like the named ones.
+-                    if (literalFloat4.count(reg))
++                    // SHD: every cooked container is of that kind, and some index the bank relatively
++                    // (a0 / aL), so the index is computed instead of being a literal.
++                    if (relative)
++                    {
++                        const char* index = instr.constAddressRegisterRelative ? "a0" : "aL";
++                        regFormatted = fmt::format(
++                            "(MASSEFFECT_UBO ? g_Ubo{0}.v[{1} + {3}] : vk::RawBufferLoad<float4>(g_PushConstants.{0}ShaderConstants + {2} + 16 * {3}, 0x10))",
++                            isPixelShader ? "Pixel" : "Vertex", reg, reg * 16, index);
++                    }
++                    else if (literalFloat4.count(reg))
+                         regFormatted = fmt::format("c{}", reg);
+                     else
+                         regFormatted = fmt::format("(MASSEFFECT_UBO ? g_Ubo{0}.v[{1}] : vk::RawBufferLoad<float4>(g_PushConstants.{0}ShaderConstants + {2}, 0x10))",
+@@ -1288,10 +1305,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+      * Only the two high bytes are compared.
+      */
+     assert((shaderContainer->flags & 0xFFFF0000) == 0x102A0000);
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++    // SHD: the stage must be known before the common header, which samples level 0 in a vertex shader.
++    if (!isPixelShader)
++        out += "#define XENOS_VERTEX_STAGE 1\n";
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+     const bool precisePosition = precisePositionEnabled(isPixelShader);
+     const auto codeMetadata = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+     const auto validFloatDefinition = [&](const Float4Definition& definition) {
+@@ -1310,14 +1330,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     // MASSEFFECT: Direct3D's own shaders either have no constant table or carry an empty CTAB.
+     // Both forms are linked by hardware register rather than by semantic names.
+     static const ConstantTableContainer kEmptyConstantTable{};
+-    const auto constantTableContainer = shaderContainer->constantTableOffset != NULL
++    const auto constantTableContainer = shaderContainer->constantTableOffset != 0u
+         ? reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset)
+         : &kEmptyConstantTable;
+-    linkByRegister = shaderContainer->constantTableOffset == NULL ||
++    linkByRegister = shaderContainer->constantTableOffset == 0u ||
+         constantTableContainer->constantTable.constants == 0;
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+     literalFloat4.clear();
+-    if (shaderContainer->definitionTableOffset != NULL)
++    if (shaderContainer->definitionTableOffset != 0u)
+     {
+         auto definitions = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset)->definitions;
+         while (*definitions != 0)
+@@ -1569,8 +1589,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 microcode[i] = words[i];
+             fetchesByRegister = vertexFetchesByRegister(microcode);
+             for (auto& [index, reg] : fetchesByRegister)
+-                if (reg >= 8)
+-                    throw std::runtime_error("vertex fetch to a register without a location (>= r8)");
++                if (reg >= 16)
++                    throw std::runtime_error("vertex fetch to a register without a location (>= r16)");
+         }
+         const uint32_t elementCount = linkByRegister ? uint32_t(fetchesByRegister.size()) : uint32_t(vertexShader->vertexElementCount);
+         for (uint32_t i = 0; i < elementCount; i++)
+@@ -1671,7 +1691,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     }
+ #endif
+ 
+-    if (shaderContainer->definitionTableOffset != NULL)
++    if (shaderContainer->definitionTableOffset != 0u)
+     {
+         auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset);
+         auto definitions = definitionTable->definitions;
+@@ -2011,10 +2031,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     // The condition belongs to the whole EXEC block, including its
+                     // return. Per-instruction ALU predication does not replace it.
+                     const auto boolean = boolConstants.find(cfInstr.condExec.boolAddress);
+-                    if (boolean == boolConstants.end())
++                    std::string mask;
++                    if (boolean != boolConstants.end())
++                        mask = boolean->second;
++                    else if (linkByRegister)
++                        // SHD: the cooked containers carry no constant table, so the boolean has no name.
++                        // g_Booleans keeps 16 bits per stage, pixel booleans start at 128 in the control flow.
++                        mask = fmt::format("(1u << {})", uint32_t(cfInstr.condExec.boolAddress) >= 128
++                                                             ? uint32_t(cfInstr.condExec.boolAddress) - 128 + 16
++                                                             : uint32_t(cfInstr.condExec.boolAddress));
++                    else
+                         throw std::runtime_error("conditional EXEC without a declared boolean constant");
+                     indent();
+-                    println("if ((g_Booleans & {}) {}= 0)", boolean->second, cfInstr.condExec.condition ? "!" : "=");
++                    println("if ((g_Booleans & {}) {}= 0)", mask, cfInstr.condExec.condition ? "!" : "=");
+                     indent();
+                     out += "{\n";
+                     ++indentation;
+@@ -2114,7 +2143,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                            // SHD (no constant table): the boolean by its g_Booleans bit, as in CondExec above.
++                            println("if ((g_Booleans & (1u << {})) {}= 0)",
++                                    uint32_t(cfInstr.condJmp.boolAddress) >= 128
++                                        ? uint32_t(cfInstr.condJmp.boolAddress) - 128 + 16
++                                        : uint32_t(cfInstr.condJmp.boolAddress),
++                                    cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                     }
+ 
+                     if (simpleControlFlow)

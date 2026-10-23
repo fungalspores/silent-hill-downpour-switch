@@ -1,100 +1,157 @@
 # Silent Hill: Downpour for Nintendo Switch
 
-A native Switch port of the **Xbox 360** version of Silent Hill: Downpour (Vatra Games / Konami, 2012),
-built with [ReXGlue](https://github.com/fungalspores/prototype-switch) — the same toolchain as the
-Prototype ports. The Xbox 360 code is recompiled to native ARM code; the graphics run on a native
-Vulkan (NVK) renderer instead of emulating the Xenos GPU.
+[Русский](README.ru.md)
 
-**This is an early test build (0.1.0).** The game boots and plays from the start to the forest, but
-there are visual defects. It is published so people can try it and send reports, not as a finished port.
+A native Nintendo Switch port of the **Xbox 360** version of Silent Hill: Downpour (Vatra Games / Konami, 2012), made by
+**static recompilation** with [ReXGlue](https://github.com/rexglue/rexglue-sdk): the game's PowerPC code is translated
+to C++ and compiled to ARM64 for Horizon OS, and its Direct3D command stream is drawn with Vulkan (NVK/Mesa).
+No emulator, no Xbox 360 GPU emulation.
 
-## Status
+**Free. Not for sale.** News: [t.me/fspores](https://t.me/fspores)
 
-Works:
+This repository has **no game files**. You need your own copy of the Xbox 360 game.
 
-* Intros, menu, brightness screen
-* Prison, lift, corridors, the street, the forest
-* Sound, music, FMV
-* Saves
-* Mostly 30 fps
+![status](https://img.shields.io/badge/Silent%20Hill%20Downpour-playable-brightgreen)
 
-Broken:
+## Download
 
-* Some wall and floor textures come out smeared or striped
-* The loading screen shows a multilingual mess instead of text
-* FMV sometimes has noise and garbage
-* Occasional stalls when new effects first appear (up to 1-2 s)
-* Nothing past the forest is tested
+Ready builds (NRO, settings, HOME-menu NSP forwarder): see **Releases**.
 
-## What you need
+## What you get
 
-* A Nintendo Switch with Atmosphère 1.8.0 or newer
-* Your own copy of Silent Hill: Downpour for Xbox 360 (ISO or an extracted folder with `default.xex`).
-  The code is recompiled against one specific `default.xex`; other releases may not boot
-* About 8 GB on the card. FAT32 is fine
-* Overclock (Horizon OC or sys-clk). Without it the frame rate is not playable
+| | Silent Hill: Downpour |
+|---|---|
+| Picture | 960x540 + FSR 1 by default; 640x360 and 1280x720 (the game's own) on the settings screen |
+| FPS* | 30 |
+| Sound, music, FMV | yes |
+| Saves | yes |
 
-Reference console: Switch Lite (Mariko) at CPU 1963 / GPU 1152 / RAM 2333 MHz, around 70 °C under load.
+\* Switch Lite (Mariko) with Horizon OC at CPU 1963 / GPU 1152 / RAM 2333 MHz. Lower at stock clocks.
+At 640x360 the forest holds 30 fps at about 57 °C instead of 70 °C at 1280x720.
 
 ## Install
 
-1. Copy the `switch` folder from a release to the root of the SD card
-2. Extract your game into `switch/shd-nx/game/` so that `default.xex` sits inside.
-   From an ISO: `extract-xiso -x "SilentHillDownpour.iso" -d game`. `$SystemUpdate` is not needed
-3. Launch `switch/shd-nx/shd.nro` from the homebrew menu
+Needs Atmosphère 1.8.0+ with sigpatches, DBI (or another NSP installer), about 8 GB on the SD card. FAT32 is fine.
 
-Do not launch through the Album — the game does not get enough memory in that mode.
+1. Copy `switch/` from the release to the root of the SD card:
+   ```
+   sdmc:/switch/rex-start.nro
+   sdmc:/switch/shd-nx/shd.nro, shd.toml, shd/cache/
+   ```
+2. Put your game files into `sdmc:/switch/shd-nx/game/` (with `default.xex` inside).
+   From an ISO: `extract-xiso -x "SilentHillDownpour.iso" -d game`. `$SystemUpdate` is not needed.
+3. Put the shader library `shd_shaders.mesp` and `shd_shaders.mesp.idx` into `sdmc:/switch/shd-nx/`
+   (built from your own disc, see [Building](#building), step 5).
+4. Install the NSP from `nsp/` with DBI and start the game from the HOME menu. It starts through `rex-start.nro`:
+   it shows the game for five seconds, and **+** opens the settings screen (internal resolution).
+   Without an NSP: hold **R** while starting any installed game and run `switch/shd-nx/shd.nro` from the Homebrew menu.
+   **Not from the Album:** applet mode does not have enough memory.
 
-## How it works
+`shd/cache/` holds about 70 MB of already compiled pipelines. Without it the game compiles every new material the
+first time it appears and the frame stops for that time. The file name carries the GPU model and the driver
+version, which are the same on every Switch, so the cache fits everyone.
 
-* The Xbox 360 executable is statically recompiled to native ARM64 (ReXGlue)
-* Graphics go through a native Vulkan renderer, not GPU emulation, so there is sound and the menus run
-  at 30 fps
-* All 15 702 game shaders are translated to SPIR-V ahead of time and shipped as a library next to the game
+### Tested edition
 
-### Fixes made for this port
+Xbox 360, title ID 4B4E0823, no title update. `default.xex` SHA-256
+`c686cbff8facad6fb6b78ed98e5a5a2f4f19337ef83517f56195a56b0db2c8d7`.
 
-* **SDK vertex fetch interpreter**: in the unsigned branch of the packed formats the components were
-  not shifted by `packed_offsets[i]`, so for `k_16_16_16_16` the y and w components were copies of x
-  and z (`0x12345678` became `0x56785678`). The signed branch shifted correctly, which is why the bug
-  survived — it also affects Prototype 1 and 2
-* **Scene copy selection**: with two copies of the HDR scene at the same address and the same frame
-  number, the renderer picked whichever came last in the iteration — the spare one, not the one written
-  last. Fixing it removed a blue-channel skew in the lift and brought back the logo reflection in the
-  puddle on the main menu
-* **Stacked resolves**: the game writes 16 colour-grading slices into one row and reads them as a
-  2D stack; the renderer handed back the whole strip as a single layer, which made the title screen
-  red and cyan
-
-## Internal resolution
-
-`shd_render_width` / `shd_render_height` in `shd.toml`, or the settings screen (press **+** in the first five
-seconds after launching from the HOME menu). Three sizes: 640x360, 960x540 and 1280x720 (the game's own).
-Lower is faster and cooler; at 640x360 the forest holds 30 fps at about 57 °C instead of 70 °C.
-
-The game's own coordinates are never changed. Render targets keep their guest size in every piece of guest logic
-(EDRAM tiles, resolve rectangles, texture identity by address and size); only the Vulkan images and commands are
-scaled, by quarter steps, and a resolve stretches the smaller image back to the guest size. Depth that the game
-reads back texel by texel is first copied into a full-size image (`DepthFullSize`).
+The code is recompiled from one specific `default.xex`; other editions may not start.
 
 ## Settings
 
-`switch/shd-nx/shd.toml`, next to the NRO. Close the game fully after editing.
+`shd.toml` next to the NRO. Restart the game after a change.
 
-| Key | Meaning |
-|---|---|
-| `user_language` | 1 = English, 12 = Russian (depends on your copy) |
-| `present_effect` | `"fsr"` or `"bilinear"` (slightly faster, softer) |
-| `p2_native_max_anisotropy` | 16 by default; 8 or 4 are faster |
-| `p2_native_max_mip_levels` | **leave at 1** — mip levels bring back square artefacts |
+| Key | Default | |
+|---|---|---|
+| `shd_render_width` x `shd_render_height` | 960x540 | internal resolution: 640x360, 960x540 or 1280x720 |
+| `present_effect` | `"fsr"` | `"bilinear"` is slightly faster and softer |
+| `p2_native_max_anisotropy` | 16 | 8 or 4 are faster |
+| `p2_native_max_mip_levels` | 1 | **leave at 1**: more mip levels bring back square artefacts |
+| `user_language` | 1 | 1 English, 12 Russian (depends on your copy) |
+
+With Horizon OC / sys-clk give the game (`0153484400000000`) its own clock profile. Do not use high overclocks on an
+Erista (original) console.
+
+## Settings screen (`rex-start/`)
+
+The same small homebrew as in [prototype-switch](https://github.com/fungalspores/prototype-switch): libnx framebuffer,
+the console's own font through FreeType, no SDL. For Silent Hill it offers the internal resolution only, writes it
+straight into `shd.toml` and copies every other line through untouched. Press nothing and the game starts as before.
+
+## What we fixed
+
+The port is built on the Prototype 2 NX native renderer (the same one as in our Prototype port) with the
+masseffect-nx Horizon SDK. Silent Hill is an Unreal Engine 3 game, and it needed its own fixes:
+
+- **Vertex fetch interpreter of the SDK.** In the unsigned branch of the packed formats the components were not
+  shifted by `packed_offsets[i]`, so for `k_16_16_16_16` the y and w components were copies of x and z
+  (`0x12345678` became `0x56785678`). The signed branch was right, which is why the bug lived on. Prototype 1 and 2
+  have it too, it just does not show there.
+- **memexport on the CPU.** UE3 moves textures around its pool with a vertex shader that writes memory
+  (memexport). The renderer skipped such draws, so every second 8-byte block of the moved textures stayed empty and
+  walls and floors came out striped. The shader now runs on the CPU through the SDK interpreter
+  (`src/native_p2/native_memexport_cpu.cpp`).
+- **Scene copy selection.** Two copies of the HDR scene lived at the same address in different formats. With equal
+  frame numbers the renderer took whichever came last in the iteration, the spare one, not the one written last.
+  Fixing it removed a blue skew in the lift and brought back the logo reflection in the puddle on the main menu.
+- **Stacked resolves.** The game writes 16 colour-grading slices into one row and reads them as a 2D stack; the
+  renderer handed back the whole strip as one layer, which made the title screen red and cyan.
+- **Internal resolution.** The game's own coordinates are never changed. Render targets keep their guest size in
+  every piece of guest logic (EDRAM tiles, resolve rectangles, texture identity by address and size); only the Vulkan
+  images and commands are scaled, by quarter steps, and a resolve stretches the smaller image back to the guest
+  size. Depth that the game reads back texel by texel is first copied into a full-size image (`DepthFullSize`).
+- **Pipeline cache.** Pipelines are compiled on worker threads, so a new material no longer stops the frame; the
+  cache is fsync'd before the rename and saved at exit (leaving through HOME used to lose it).
+- The SDK fixes from Prototype (saves, console signatures, critical sections) and the speed patches of the
+  generated code (`shd/tools/`).
+
+A splash with the credit is shown for 3 seconds before the game (skip with A/B/+).
+
+## Building
+
+Everything was built **on an Android phone** (Alpine Linux in PRoot, aarch64) without Docker; a normal Linux box
+works the same way. Steps 1-3 are the same as in
+[prototype-switch](https://github.com/fungalspores/prototype-switch#building) (`tools/proot/` is a copy).
+
+1. **devkitA64**: `tools/proot/pull_dka64.py`; on musl hosts `tools/proot/patch_dkp.sh` and `wrap_dkp.sh`.
+2. **SDK**: [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx) at `a85b0b4` +
+   `patches/rexglue-sdk-masseffect-nx.patch`, third-party sources with its `tools/fetch_thirdparty.py`, host
+   `rexglue` built as in prototype-switch.
+3. **Mesa/NVK**: [mesa-switch](https://github.com/danfromtico/mesa-switch) at `d4a00ea0ab3` +
+   `patches/mesa-switch.patch`, then `tools/proot/mesa_p2_build.sh`.
+4. **Silent Hill**: extract the disc into `game/` next to `shd/`, then `REXGLUE=... REXSDK_DIR=... NVK_SDK=... shd/build.sh`
+   (codegen a few minutes, NRO about 35 minutes; `glslangValidator` on the host PATH).
+5. **Shader library**: `R=<folder with game/> ME=<masseffect-nx at 650e14e + patches/masseffect-nx-xenosrecomp.patch>
+   REXSDK=<patched SDK> DXC=<DXC built for the host> sh shd/tools/build_shaders.sh` (about 25 minutes). It pulls the
+   15 702 shader containers out of the UE3 packages, turns them into HLSL with XenosRecomp, compiles SPIR-V with DXC
+   and packs `shd_shaders.mesp` + `.idx`.
+6. **Settings screen**: `rex-start/build.sh` (devkitA64 + FreeType from the portlibs).
+7. **NSP forwarder**: `forwarder/build_forwarder.py --launcher sdmc:/switch/rex-start.nro --nro sdmc:/switch/shd-nx/shd.nro --icon art/icon_shd.jpg --title "Silent Hill Downpour" --author fungalspores --version 0.2.0 --tid 0153484400000000 --keys <your prod.keys> --out out/`
+   (needs [Forwarder-Mod](https://github.com/Skywalker25/Forwarder-Mod) `9853bd9` cloned to `forwarder/loader`).
+   Your own `prod.keys` only; never publish them.
+
+`docs/D3D_SHD.md` is the map of the game's XDK Direct3D objects (in Russian).
 
 ## Reporting
 
-Logs are written to `switch/shd-nx/logs/`. A log of the session plus a screenshot is what makes a
-defect findable.
-
+Logs are written to `switch/shd-nx/logs/`. A log of the session plus a screenshot is what makes a defect findable.
 Telegram: [t.me/fspores](https://t.me/fspores)
 
-## Licence
+## Credits
 
-See `LICENSE`. The game itself is not distributed — you need your own copy.
+- **penettrator**: [prototype2-nx](https://github.com/penettrator/prototype2-nx), the native renderer this port draws with.
+- **NebadasSwifty**: [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx), the SDK with the Horizon layer
+  and the shader pipeline (XenosRecomp, the `.mesp` library).
+- **StevensND**: the Horizon layer of ReXGlue and [nfsmw-nx](https://github.com/StevensND/nfsmw-nx).
+- **R-drg**: [project8-sw](https://github.com/R-drg/project8-sw), the base of the native renderer.
+- **DownpourRecomp**: addresses and the colour-grading path, which we checked our findings against.
+- **Tom Clay** and the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk); the [Xenia](https://xenia.jp) project.
+- **danfromtico**: [mesa-switch](https://github.com/danfromtico/mesa-switch); the [Mesa](https://mesa3d.org) project.
+- **Skywalker25**: [Forwarder-Mod](https://github.com/Skywalker25/Forwarder-Mod); switchbrew (libnx); devkitPro.
+- AMD FidelityFX Super Resolution 1.
+
+## License
+
+GPL-3.0 (see `LICENSE`); third-party components under their own licenses. Silent Hill is a trademark of Konami.
+This project is not affiliated with Konami, Vatra Games, Microsoft or Nintendo and contains none of their files.
