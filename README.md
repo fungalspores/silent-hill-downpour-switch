@@ -22,12 +22,10 @@ Ready builds (NRO, settings, HOME-menu NSP forwarder): see **Releases**.
 | | Silent Hill: Downpour |
 |---|---|
 | Picture | 640x360 + FSR 1 by default (recommended); 960x540 and 1280x720 (the game's own) on the settings screen |
-| FPS* | 30 |
-| Sound, music, FMV | yes |
-| Saves | yes |
+| Status | everything works, 30 fps* |
 
 \* Switch Lite (Mariko) with Horizon OC at CPU 1963 / GPU 1152 / RAM 2333 MHz. Lower at stock clocks.
-At 640x360 the forest holds 30 fps at about 57 °C instead of 70 °C at 1280x720.
+At 640x360 the console runs at about 57 °C instead of 70 °C at 1280x720.
 
 ## Install
 
