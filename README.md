@@ -38,17 +38,17 @@ Needs Atmosphère 1.8.0+ with sigpatches, DBI (or another NSP installer), about 
    ```
 2. Put your game files into `sdmc:/switch/shd-nx/game/` (with `default.xex` inside).
    From an ISO: `extract-xiso -x "SilentHillDownpour.iso" -d game`. `$SystemUpdate` is not needed.
-3. Put the shader library `shd_shaders.mesp` and `shd_shaders.mesp.idx` into `sdmc:/switch/shd-nx/`
-   (built from your own disc, see [Building](#building), step 5).
-4. Install the NSP from `nsp/` with DBI and start the game from the HOME menu. It starts through `rex-start.nro`:
+3. Install the NSP from `nsp/` with DBI and start the game from the HOME menu. It starts through `rex-start.nro`:
    it shows the game for five seconds, and **+** opens the settings screen (internal resolution).
    Without an NSP: hold **R** while starting any installed game and run `switch/shd-nx/shd.nro` from the Homebrew menu.
    **Not from the Album:** applet mode does not have enough memory.
 
-Neither the shader library nor compiled shaders are shipped: both are made from the game's own shaders. The
-prewarm file is not shipped either: besides pipeline keys it contains the Xenos microcode of the game's shaders.
-On the first start the game compiles pipelines in the background from your library, so the first minutes may
-stutter. The driver cache and prewarm list are then generated locally on your card.
+The default `shd_renderer = "p2"` translates the game's shaders at runtime, so **no shader library is needed**.
+The older `shd_renderer = "me"` path can use an offline `shd_shaders.mesp` built from your disc (Building, step 5).
+Neither that library nor compiled shaders are shipped: both are made from the game's own shaders. The prewarm file
+is not shipped either: besides pipeline keys it contains Xenos microcode. On the first start the game compiles
+pipelines in the background from the game's microcode, so the first minutes may stutter. The driver cache and
+prewarm list are then generated locally on your card.
 
 ### Tested edition
 
@@ -121,7 +121,8 @@ works the same way. Steps 1-3 are the same as in
    `patches/mesa-switch.patch`, then `tools/proot/mesa_p2_build.sh`.
 4. **Silent Hill**: extract the disc into `game/` next to `shd/`, then `REXGLUE=... REXSDK_DIR=... NVK_SDK=... shd/build.sh`
    (codegen a few minutes, NRO about 35 minutes; `glslangValidator` on the host PATH).
-5. **Shader library**: `R=<folder with game/> ME=<masseffect-nx at 650e14e + patches/masseffect-nx-xenosrecomp.patch>
+5. **Shader library, only for the legacy `me` renderer** (the default `p2` renderer does not need it):
+   `R=<folder with game/> ME=<masseffect-nx at 650e14e + patches/masseffect-nx-xenosrecomp.patch>
    REXSDK=<patched SDK> DXC=<DXC built for the host> sh shd/tools/build_shaders.sh` (about 25 minutes). It pulls the
    15 702 shader containers out of the UE3 packages, turns them into HLSL with XenosRecomp, compiles SPIR-V with DXC
    and packs `shd_shaders.mesp` + `.idx`.
