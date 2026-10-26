@@ -118,7 +118,7 @@ set_source_files_properties("${GEN}/shd_register.cpp"
 foreach(t shd shd_recomp)
     target_compile_options(${t} PRIVATE -ffp-contract=off -fno-strict-aliasing)
 endforeach()
-rexglue_switch_add_nro(shd NAME "Silent Hill: Downpour" AUTHOR "fungalspores" VERSION "0.2.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
+rexglue_switch_add_nro(shd NAME "Silent Hill: Downpour" AUTHOR "fungalspores" VERSION "0.3.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
 # (Prototype wrapped bqQueueBuffer for its presenter; the Mass Effect renderer does not.)
 
 # Profile-guided optimization: later, once the game runs (see the Prototype port).

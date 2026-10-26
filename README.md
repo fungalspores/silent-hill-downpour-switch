@@ -21,7 +21,7 @@ Ready builds (NRO, settings, HOME-menu NSP forwarder): see **Releases**.
 
 | | Silent Hill: Downpour |
 |---|---|
-| Picture | 640x360 + FSR 1 by default (recommended); 960x540 and 1280x720 (the game's own) on the settings screen |
+| Picture | 720x405 + FSR 1 and sharp subtitles by default (recommended); modes from 640x360 to 1280x720 on the settings screen |
 | Status | everything works, 30 fps* |
 
 \* Switch Lite (Mariko) with Horizon OC at CPU 1963 / GPU 1152 / RAM 2333 MHz. Lower at stock clocks.
@@ -39,7 +39,7 @@ Needs Atmosphère 1.8.0+ with sigpatches, DBI (or another NSP installer), about 
 2. Put your game files into `sdmc:/switch/shd-nx/game/` (with `default.xex` inside).
    From an ISO: `extract-xiso -x "SilentHillDownpour.iso" -d game`. `$SystemUpdate` is not needed.
 3. Install the NSP from `nsp/` with DBI and start the game from the HOME menu. It starts through `rex-start.nro`:
-   it shows the game for five seconds, and **+** opens the settings screen (internal resolution).
+   it shows the game for five seconds, and **+** opens the settings screen (internal resolution and subtitle quality).
    Without an NSP: hold **R** while starting any installed game and run `switch/shd-nx/shd.nro` from the Homebrew menu.
    **Not from the Album:** applet mode does not have enough memory.
 
@@ -63,7 +63,8 @@ The code is recompiled from one specific `default.xex`; other editions may not s
 
 | Key | Default | |
 |---|---|---|
-| `shd_render_width` x `shd_render_height` | 640x360 | internal resolution: 640x360, 960x540 or 1280x720 |
+| `shd_render_width` x `shd_render_height` | 720x405 | internal resolution: 640x360, 720x405, 800x450, 880x495, 960x540, 1040x585, 1120x630 or 1280x720 |
+| `shd_ui_native` | true | sharp Scaleform subtitles/UI after the first glyph draw of a frame; false gives ordinary text and less GPU work |
 | `present_effect` | `"fsr"` | `"bilinear"` is slightly faster and softer |
 | `p2_native_max_anisotropy` | 16 | 8 or 4 are faster |
 | `p2_native_max_mip_levels` | 1 | **leave at 1**: more mip levels bring back square artefacts |
@@ -75,8 +76,9 @@ Erista (original) console.
 ## Settings screen (`rex-start/`)
 
 The same small homebrew as in [prototype-switch](https://github.com/fungalspores/prototype-switch): libnx framebuffer,
-the console's own font through FreeType, no SDL. For Silent Hill it offers the internal resolution only, writes it
-straight into `shd.toml` and copies every other line through untouched. Press nothing and the game starts as before.
+the console's own font through FreeType, no SDL. For Silent Hill it offers internal resolution and subtitle quality,
+marks `720x405` and `high` as recommended, writes the choice straight into `shd.toml` and copies every other line
+through untouched. Press nothing and the game starts as before.
 
 ## What we fixed
 
@@ -98,10 +100,16 @@ masseffect-nx Horizon SDK. Silent Hill is an Unreal Engine 3 game, and it needed
   renderer handed back the whole strip as one layer, which made the title screen red and cyan.
 - **Internal resolution.** The game's own coordinates are never changed. Render targets keep their guest size in
   every piece of guest logic (EDRAM tiles, resolve rectangles, texture identity by address and size); only the Vulkan
-  images and commands are scaled, by quarter steps, and a resolve stretches the smaller image back to the guest
-  size. Depth that the game reads back texel by texel is first copied into a full-size image (`DepthFullSize`).
-- **Pipeline cache.** Pipelines are compiled on worker threads, so a new material no longer stops the frame; the
-  cache is fsync'd before the rename and saved at exit (leaving through HOME used to lose it).
+  images and commands are scaled, in 1/16 steps (80 pixels of width), and a resolve stretches the smaller image back
+  to the guest size. Depth that the game reads back texel by texel is first copied into a full-size image
+  (`DepthFullSize`).
+- **Sharp subtitles.** Scaleform text is drawn into the `1040`-pitch AuxColor target, not directly into the final
+  `1280`-pitch frame. After the first glyph draw of a frame, both targets switch to guest-native images while a blit
+  preserves their contents: text gets 1024x720 instead of roughly 576x405 with 3D at 720x405. Before the text and on
+  the next frame the renderer returns to the selected internal resolution; passes with depth or multiple colour
+  targets never use native UI. This sharpens text without moving the whole 3D scene to 720p.
+- **Pipeline cache.** Known pipelines are prewarmed; the cache is fsync'd before the rename and saved at exit
+  (leaving through HOME used to lose it).
 - The SDK fixes from Prototype (saves, console signatures, critical sections) and the speed patches of the
   generated code (`shd/tools/`).
 
@@ -127,7 +135,7 @@ works the same way. Steps 1-3 are the same as in
    15 702 shader containers out of the UE3 packages, turns them into HLSL with XenosRecomp, compiles SPIR-V with DXC
    and packs `shd_shaders.mesp` + `.idx`.
 6. **Settings screen**: `rex-start/build.sh` (devkitA64 + FreeType from the portlibs).
-7. **NSP forwarder**: `forwarder/build_forwarder.py --launcher sdmc:/switch/rex-start.nro --nro sdmc:/switch/shd-nx/shd.nro --icon art/icon_shd.jpg --title "Silent Hill Downpour" --author fungalspores --version 0.2.0 --tid 0153484400000000 --keys <your prod.keys> --out out/`
+7. **NSP forwarder**: `forwarder/build_forwarder.py --launcher sdmc:/switch/rex-start.nro --nro sdmc:/switch/shd-nx/shd.nro --icon art/icon_shd.jpg --title "Silent Hill Downpour" --author fungalspores --version 0.3.0 --tid 0153484400000000 --keys <your prod.keys> --out out/`
    (needs [Forwarder-Mod](https://github.com/Skywalker25/Forwarder-Mod) `9853bd9` cloned to `forwarder/loader`).
    Your own `prod.keys` only; never publish them.
 

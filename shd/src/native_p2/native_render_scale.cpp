@@ -14,6 +14,11 @@ REXCVAR_DEFINE_BOOL(shd_scale_msaa, false, "SilentHill",
                     "Scale surfaces drawn with their MSAA samples as pixels too. Off: they keep the "
                     "guest size (diagnostic for the scene repeat at 960); restart required")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(shd_ui_native, false, "SilentHill",
+                    "Sharper Scaleform text: after the first glyph draw of a frame, render the "
+                    "1040-pitch text target and its 1280-pitch composition at guest-native size; "
+                    "3D and earlier post-process still follow shd_render_width; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(shd_diag_scale, false, "SilentHill",
                     "Diagnostics of the internal resolution: [shd-scale] / [shd-vp] lines in the log "
                     "(targets, passes, resolve paths); off in release builds")
@@ -26,29 +31,26 @@ namespace {
 constexpr uint32_t kGameWidth = 1280;
 }  // namespace
 
-// Quarters from the asked width: 1280 -> 4 (the game's own), 960 -> 3, 640 -> 2. The height
-// follows the width, as the frame is 16:9 either way; a width between two quarters goes to the
-// nearer one, so the picture never stretches.
-uint32_t WantedQuarters() {
+// Sixteenths from the asked width: 1280 -> 16 (the game's own), 960 -> 12, 720 -> 9,
+// 640 -> 8. The height follows the width, as the frame is 16:9 either way; intermediate 80-pixel
+// steps are exact and do not stretch the picture.
+uint32_t WantedScale16() {
   static const uint32_t q = [] {
     const uint32_t width = std::clamp<uint32_t>(REXCVAR_GET(shd_render_width), 640, kGameWidth);
-    uint32_t quarters =
-        std::clamp<uint32_t>((width * kNative + kGameWidth / 2) / kGameWidth, 2, kNative);
-    // Only halves and full size. The engine draws the frame through targets of several pitches
-    // (1280, 1040, 880, 640 in the forest) and three quarters of 1040 or 880 is not a whole
-    // 8-pixel group: those targets came out a pixel off from the ones that divided evenly, and
-    // the seams showed as noise along every edge. A half is exact for all of them.
-    // 3/4 (960x540) is allowed again: it was forced to 1/2 on a guess about pixel alignment that
-    // was never confirmed -- the edge noise of that night came from the depth paths, since fixed.
-    if (quarters != kNative) {
-      REXLOG_INFO("[shd-quality] internal render scale {}/4: {}x{} (game 1280x720)", quarters,
-                  ScaleSize(kGameWidth, quarters), ScaleSize(720, quarters));
+    const uint32_t sixteenths =
+        std::clamp<uint32_t>((width * kNative + kGameWidth / 2) / kGameWidth, 8, kNative);
+    // 3/4 (960x540) was once disabled on a guess about pixel alignment that was never confirmed;
+    // the edge noise of that night came from the depth paths, since fixed. Keep all sixteenths
+    // available, with the old presets using exactly their former edge arithmetic.
+    if (sixteenths != kNative) {
+      REXLOG_INFO("[shd-quality] internal render scale {}/16: {}x{} (game 1280x720)", sixteenths,
+                  ScaleSize(kGameWidth, sixteenths), ScaleSize(720, sixteenths));
     }
-    return quarters;
+    return sixteenths;
   }();
   return q;
 }
 
-bool Enabled() { return WantedQuarters() != kNative; }
+bool Enabled() { return WantedScale16() != kNative; }
 
 }  // namespace shd::render_scale

@@ -15,6 +15,7 @@
 #include "native_renderer.h"
 #include "native_render_scale.h"
 REXCVAR_DECLARE(uint32_t, shd_scale_pitches);
+REXCVAR_DECLARE(bool, shd_ui_native);
 REXCVAR_DECLARE(bool, shd_diag_scale);
 namespace {
 // Diagnostics of the internal-resolution path (off for release builds): one switch for every
@@ -506,8 +507,15 @@ struct RenderTarget {
   // The GUEST size: what every guest-side rule about this target is written in terms of.
   uint32_t width = 0;
   uint32_t height = 0;
-  // The host image is the guest size scaled by scale_q / 4 (4 = the game's own resolution).
+  // The host image is the guest size scaled by scale_q / 16 (16 = the game's own resolution).
   uint32_t scale_q = shd::render_scale::kNative;
+  // Downpour only: the final RGBA8 target can have a second, native-size image for depth-less
+  // post/UI passes. The inactive image is kept here; switching preserves the contents with a blit.
+  bool native_ui_capable = false;
+  VkImage alternate_image = VK_NULL_HANDLE;
+  VkDeviceMemory alternate_memory = VK_NULL_HANDLE;
+  VkImageView alternate_view = VK_NULL_HANDLE;
+  uint32_t alternate_scale_q = 0;
   uint64_t last_used_frame = 0;
   uint32_t HostWidth() const { return shd::render_scale::ScaleSize(width, scale_q); }
   uint32_t HostHeight() const { return shd::render_scale::ScaleSize(height, scale_q); }
@@ -913,7 +921,10 @@ struct Renderer::Impl {
       render_targets;
   bool in_pass = false;
   PassTargets pass;
-  // The GUEST extent of the pass; the host attachments are this scaled by pass_scale_q / 4.
+  // Shared by the 1040-pitch text target and the 1280-pitch composition target. A glyph draw
+  // starts this phase; the next frame without a new glyph starts all such targets scaled again.
+  uint64_t native_ui_phase_frame = UINT64_MAX;
+  // The GUEST extent of the pass; the host attachments are this scaled by pass_scale_q / 16.
   VkExtent2D pass_extent = {};
   uint32_t pass_scale_q = shd::render_scale::kNative;
 
@@ -2156,6 +2167,7 @@ struct Renderer::Impl {
   // --- Render targets ------------------------------------------------------------
 
   RenderTarget* GetRenderTarget(const RenderTargetKey& key, uint32_t min_height);
+  bool SwitchRenderTargetScale(RenderTarget* rt, uint32_t wanted_q);
   enum class PassEnd : uint32_t { Submit, TargetCreate, TargetChange, Resolve,
                                  ClearBegin, ClearEnd, Present, Count };
   bool resolve_probe_enabled = false;
@@ -2260,7 +2272,7 @@ struct Renderer::Impl {
       in_pass = false;
     }
   }
-  bool BeginPass(const PassTargets& targets);
+  bool BeginPass(const PassTargets& targets, bool native_ui_text = false);
 
   // --- Draws ---------------------------------------------------------------------
 
@@ -2816,7 +2828,7 @@ bool Renderer::Impl::DepthWordsDirect(VkCommandBuffer c, const RenderTarget& sou
                                       int32_t y0, uint32_t width, uint32_t height) {
   if (!width || !height || dest.format != VK_FORMAT_R32_SFLOAT) return false;
   // This reads the depth texel by texel through source.sample_view, in guest coordinates. A target
-  // drawn at q/4 does not have those texels, and the shader walked off the edge of the smaller
+  // drawn at q/16 does not have those texels, and the shader walked off the edge of the smaller
   // image: the shadows and fog it feeds came out as torn blocks. Fall back to the buffer route,
   // which goes through the full-size scratch (DepthFullSize).
   if (source.scale_q != shd::render_scale::kNative) return false;
@@ -3215,6 +3227,9 @@ void Renderer::Impl::Shutdown() {
     if (rt->view) dfn().vkDestroyImageView(vk, rt->view, nullptr);
     if (rt->image) dfn().vkDestroyImage(vk, rt->image, nullptr);
     if (rt->memory) dfn().vkFreeMemory(vk, rt->memory, nullptr);
+    if (rt->alternate_view) dfn().vkDestroyImageView(vk, rt->alternate_view, nullptr);
+    if (rt->alternate_image) dfn().vkDestroyImage(vk, rt->alternate_image, nullptr);
+    if (rt->alternate_memory) dfn().vkFreeMemory(vk, rt->alternate_memory, nullptr);
   }
   render_targets.clear();
   for (auto& retired : retired_render_targets) {
@@ -5102,14 +5117,13 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   auto rt = std::make_unique<RenderTarget>();
   rt->key = key;
   rt->width = std::max(key.pitch, 1u);
-  // The guest aligns a target's height to the EDRAM tile (16 rows). With a scale of q/4 the host
-  // height must land on a whole tile too, or two targets of the same guest height come out
-  // different host heights (720 * 3/4 = 540, which is not a multiple of 16) and the colour and
-  // depth of one pass disagree by a row: the depth test then lands between pixels and the edges
-  // of foliage and rock turn to noise. Aligning the guest height to 16 * 4 / q keeps both whole.
+  // The guest aligns a target's height to the EDRAM tile (16 rows). Keep the former alignment
+  // rule, expressed in the new sixteenths: old quarters become q/16, so 16*4/old_q is 16*16/q.
+  // At q=8 and q=12 this is exactly the old 640 and 960 behaviour; intermediate scales get the
+  // same guest-side treatment rather than a special-case size.
   {
-    const uint32_t q = shd::render_scale::WantedQuarters();
-    const uint32_t guest_tile = q == shd::render_scale::kNative ? 16u : (16u * 4u) / q;
+    const uint32_t q = shd::render_scale::WantedScale16();
+    const uint32_t guest_tile = q == shd::render_scale::kNative ? 16u : (16u * 16u) / q;
     rt->height = rex::align(min_height, guest_tile);
   }
   rt->samples = VkSampleCountFlagBits(1u << key.msaa);
@@ -5120,7 +5134,7 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   info.imageType = VK_IMAGE_TYPE_2D;
   info.format = rt->format;
-  // The guest size stays in rt->width / rt->height; the VkImage is that size scaled (q/4), so
+  // The guest size stays in rt->width / rt->height; the VkImage is that size scaled (q/16), so
   // every guest-side rule about this target is untouched and only the Vulkan commands differ.
   //
   // Colour and depth are scaled together, always. A pass draws into both, and a depth test only
@@ -5223,7 +5237,18 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   // of the frame -- the rectangle with the silhouette, in the menu and in the game (log shd_173).
   const bool aux_screen = key.pitch == 1040 && (pitch_mask & 2);
   const bool screen_pitch = (key.pitch == 1280 && (pitch_mask & 1)) || half_screen || aux_screen;
-  rt->scale_q = screen_pitch ? shd::render_scale::WantedQuarters() : shd::render_scale::kNative;
+  // shd_207 proved the actual Scaleform text target: RGBA8, EDRAM tile 0x2D0, pitch 1040
+  // (AuxColor, guest viewport 1024x720). The same RGBA8/base pair at pitch 1280 is the later
+  // composition target; it must follow the text phase too or it would downsample the glyphs.
+  // Both are also used with depth by non-UI passes, so neither may be permanently native.
+  const bool scaled_ui_pitch =
+      (key.pitch == 1040 && (pitch_mask & 2)) || (key.pitch == 1280 && (pitch_mask & 1));
+  rt->native_ui_capable =
+      REXCVAR_GET(shd_ui_native) && !key.is_depth && key.base_tiles == 0x2D0 &&
+      scaled_ui_pitch && key.format == uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8) &&
+      shd::render_scale::WantedScale16() != shd::render_scale::kNative &&
+      Extra(device).vkCmdBlitImage != nullptr;
+  rt->scale_q = screen_pitch ? shd::render_scale::WantedScale16() : shd::render_scale::kNative;
   // What the scale actually produces, per target: the first targets of a session, with their
   // guest and host sizes side by side. A host size that is not what the arithmetic promises, or
   // two targets of one pass with different host heights, names the bug instead of guessing at it.
@@ -5231,11 +5256,11 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     static uint32_t reported = 0;
     if (reported < 20) {
       ++reported;
-      if (ShdDiagScaleOn()) REXLOG_INFO("[shd-scale] target {} {}x{} guest -> {}x{} host (pitch {}, fmt {}, msaa {})",
+      if (ShdDiagScaleOn()) REXLOG_INFO("[shd-scale] target {} {}x{} guest -> {}x{} host (base {:03X}, pitch {}, fmt {}, msaa {}, native UI capable {})",
                   key.is_depth ? "depth" : "color", rt->width, rt->height,
                   shd::render_scale::ScaleSize(rt->width, rt->scale_q),
-                  shd::render_scale::ScaleSize(rt->height, rt->scale_q), key.pitch, key.format,
-                  key.msaa);
+                  shd::render_scale::ScaleSize(rt->height, rt->scale_q), key.base_tiles, key.pitch,
+                  key.format, key.msaa, rt->native_ui_capable);
     }
   }
   info.extent = {shd::render_scale::ScaleSize(rt->width, rt->scale_q),
@@ -5307,15 +5332,6 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     VkImageCopy copy = {};
     copy.srcSubresource = {aspect, 0, 0, 1};
     copy.dstSubresource = copy.srcSubresource;
-    // Host pixels: both images are their guest size scaled, and a copy names host extents. With
-    // the two at the same scale (always, within a session) this is the guest extent scaled once.
-    // Both images must be at the same scale for a copy: a target recreated taller keeps the
-    // scale of the session, so they always are, but if that ever changes the copy would move the
-    // old contents to the wrong pixels rather than fail visibly.
-    if (old->scale_q != rt->scale_q) {
-      if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] target recreated at another scale ({}/4 -> {}/4): contents dropped",
-                  old->scale_q, rt->scale_q);
-    }
     copy.extent = {shd::render_scale::ScaleSize(std::min(old->width, rt->width), rt->scale_q),
                    shd::render_scale::ScaleSize(old->height, rt->scale_q), 1};
     VkMemoryBarrier memory_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -5326,12 +5342,32 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memory_barrier, 0, nullptr,
                                0, nullptr);
-    Extra(device).vkCmdCopyImage(c, old->image, VK_IMAGE_LAYOUT_GENERAL, rt->image,
-                         VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-    // Destroyed once this frame is done on the GPU (waiting for idle here
-    // was a visible hitch).
+    if (old->scale_q == rt->scale_q) {
+      Extra(device).vkCmdCopyImage(c, old->image, VK_IMAGE_LAYOUT_GENERAL, rt->image,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    } else {
+      // A native UI image can be the live one when the target has to grow. vkCmdCopyImage cannot
+      // copy between different extents: resample just the old guest rectangle into the new scale.
+      VkImageBlit scaled_copy = {};
+      scaled_copy.srcSubresource = {aspect, 0, 0, 1};
+      scaled_copy.dstSubresource = scaled_copy.srcSubresource;
+      scaled_copy.srcOffsets[1] = {int32_t(old->HostWidth()), int32_t(old->HostHeight()), 1};
+      scaled_copy.dstOffsets[1] = {int32_t(copy.extent.width), int32_t(copy.extent.height), 1};
+      Extra(device).vkCmdBlitImage(c, old->image, VK_IMAGE_LAYOUT_GENERAL, rt->image,
+                                   VK_IMAGE_LAYOUT_GENERAL, 1, &scaled_copy,
+                                   key.is_depth ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+      if (ShdDiagScaleOn()) {
+        REXLOG_INFO("[shd-scale] target recreated at another scale ({}/16 -> {}/16): resampled",
+                    old->scale_q, rt->scale_q);
+      }
+    }
+    // Destroyed once this frame is done on the GPU (waiting for idle here was a visible hitch).
     retired_render_targets.push_back(
         {frame, old->image, old->view, old->sample_view, old->stencil_view, old->memory});
+    if (old->alternate_image) {
+      retired_render_targets.push_back({frame, old->alternate_image, old->alternate_view,
+                                        VK_NULL_HANDLE, VK_NULL_HANDLE, old->alternate_memory});
+    }
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                            VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -5354,7 +5390,151 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   return result;
 }
 
-bool Renderer::Impl::BeginPass(const PassTargets& targets) {
+// Switches Downpour's final RGBA8 target between its ordinary scaled image and a native UI image.
+// Both images stay GENERAL. The live contents are resampled on every switch, so a resolve sees the
+// image used by the most recent pass and the next pass never starts from a stale copy.
+bool Renderer::Impl::SwitchRenderTargetScale(RenderTarget* rt, uint32_t wanted_q) {
+  if (!rt || rt->scale_q == wanted_q) return true;
+  if (rt->key.is_depth || !rt->native_ui_capable || rt->sample_view || rt->stencil_view ||
+      !wanted_q || !Extra(device).vkCmdBlitImage ||
+      (rt->alternate_image && rt->alternate_scale_q != wanted_q)) {
+    return false;
+  }
+  BeginRecording();
+  EndPass(PassEnd::TargetChange);
+  FlushResolveBarrier();
+  VkCommandBuffer c = cmd();
+
+  if (!rt->alternate_image) {
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = rt->format;
+    info.extent = {shd::render_scale::ScaleSize(rt->width, wanted_q),
+                   shd::render_scale::ScaleSize(rt->height, wanted_q), 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = rt->samples;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+            device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            rt->alternate_image, rt->alternate_memory)) {
+      if (rt->alternate_image) dfn().vkDestroyImage(vk, rt->alternate_image, nullptr);
+      if (rt->alternate_memory) dfn().vkFreeMemory(vk, rt->alternate_memory, nullptr);
+      rt->alternate_image = VK_NULL_HANDLE;
+      rt->alternate_memory = VK_NULL_HANDLE;
+      return false;
+    }
+    VkImageViewCreateInfo view = {};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = rt->alternate_image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = rt->format;
+    view.subresourceRange =
+        rex::ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    if (dfn().vkCreateImageView(vk, &view, nullptr, &rt->alternate_view) != VK_SUCCESS) {
+      dfn().vkDestroyImage(vk, rt->alternate_image, nullptr);
+      dfn().vkFreeMemory(vk, rt->alternate_memory, nullptr);
+      rt->alternate_image = VK_NULL_HANDLE;
+      rt->alternate_memory = VK_NULL_HANDLE;
+      rt->alternate_view = VK_NULL_HANDLE;
+      return false;
+    }
+    rt->alternate_scale_q = wanted_q;
+    VkImageMemoryBarrier to_general = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_general.srcAccessMask = 0;
+    to_general.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.image = rt->alternate_image;
+    to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                               &to_general);
+  }
+
+  // Finish both colour writes and any earlier reads before one image becomes the blit destination.
+  VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
+                             nullptr);
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.srcOffsets[1] = {int32_t(rt->HostWidth()), int32_t(rt->HostHeight()), 1};
+  blit.dstOffsets[1] = {
+      int32_t(shd::render_scale::ScaleSize(rt->width, rt->alternate_scale_q)),
+      int32_t(shd::render_scale::ScaleSize(rt->height, rt->alternate_scale_q)), 1};
+  Extra(device).vkCmdBlitImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, rt->alternate_image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+  VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0,
+                             nullptr);
+
+  const uint32_t old_q = rt->scale_q;
+  std::swap(rt->image, rt->alternate_image);
+  std::swap(rt->memory, rt->alternate_memory);
+  std::swap(rt->view, rt->alternate_view);
+  std::swap(rt->scale_q, rt->alternate_scale_q);
+  static uint32_t switch_logs = 0;
+  if (switch_logs < 12) {
+    ++switch_logs;
+    if (ShdDiagScaleOn()) {
+      REXLOG_INFO("[shd-quality] UI target switched {}/16 -> {}/16: {}x{} -> {}x{} host (frame {}, submission {})",
+                  old_q, rt->scale_q, shd::render_scale::ScaleSize(rt->width, old_q),
+                  shd::render_scale::ScaleSize(rt->height, old_q), rt->HostWidth(),
+                  rt->HostHeight(), frame, submission_number);
+    }
+  }
+  return true;
+}
+
+bool Renderer::Impl::BeginPass(const PassTargets& targets, bool native_ui_text) {
+  // Only a depth-less, single-colour pass with a GFx glyph draw starts native UI. Later UI passes
+  // of that frame keep it; everything before the text and every new frame starts scaled. Depth or
+  // multiple colours always force the ordinary scaled image before Vulkan sees the attachments.
+  const bool single_color_ui_pass = !targets.depth && targets.color[0] && !targets.color[1] &&
+                                    !targets.color[2] && !targets.color[3];
+  static uint32_t native_ui_pass_logs = 0;
+  if (native_ui_text && native_ui_pass_logs < 16) {
+    ++native_ui_pass_logs;
+    if (ShdDiagScaleOn()) {
+      const RenderTarget* rt = targets.color[0];
+      REXLOG_INFO("[shd-ui] text pass: single {} depth {} base {:03X} pitch {} fmt {} capable {} scale {} frame {}",
+                  single_color_ui_pass, targets.depth != nullptr, rt ? rt->key.base_tiles : 0,
+                  rt ? rt->key.pitch : 0, rt ? rt->key.format : 0,
+                  rt ? rt->native_ui_capable : false, rt ? rt->scale_q : 0, frame);
+    }
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    RenderTarget* rt = targets.color[i];
+    if (!rt || !rt->native_ui_capable) continue;
+    // Native starts at the first glyph draw and may cover the remaining single-colour UI passes
+    // of THIS frame, including the 1040 -> 1280 composition. The first non-text pass of the next
+    // frame returns to scaled, so post-process never becomes permanently native (shd_203).
+    const bool native_phase =
+        single_color_ui_pass && (native_ui_text || native_ui_phase_frame == frame);
+    const uint32_t wanted_q = native_phase ? shd::render_scale::kNative
+                                           : shd::render_scale::WantedScale16();
+    if (rt->scale_q != wanted_q && !SwitchRenderTargetScale(rt, wanted_q)) {
+      if (!native_phase) return false;  // never run a known mismatched attachment pass
+      // Allocation/blit failure must not remove the UI: keep using the ordinary scaled image.
+      rt->native_ui_capable = false;
+      REXLOG_WARN("[shd-quality] native UI unavailable; continuing with the scaled target");
+    }
+    if (native_phase && rt->scale_q == shd::render_scale::kNative) {
+      native_ui_phase_frame = frame;
+    }
+  }
   if (in_pass) {
     // Keep the scope if every attachment the draw needs is already bound at
     // the same slot.
@@ -5400,7 +5580,7 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
   if (width == UINT32_MAX) {
     return false;
   }
-  // Guest size in, host size out: the attachments are q/4 of the guest size, so the area the pass
+  // Guest size in, host size out: the attachments are q/16 of the guest size, so the area the pass
   // covers must be too, or the scaled image is drawn into a corner of itself.
   // The pass runs at the scale its attachments actually have, which is the scale of the first one
   // bound: a colour target and a depth target of different scales (a scaled screen colour with the
@@ -5416,14 +5596,14 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
     for (uint32_t i = 0; i < 4 && !first_color; ++i) first_color = targets.color[i];
     pass_scale_q = first_color ? first_color->scale_q
                    : targets.depth ? targets.depth->scale_q
-                                   : shd::render_scale::WantedQuarters();
+                                   : shd::render_scale::WantedScale16();
     // Every attachment must agree, not just the first: a pass bound to two colour targets of
     // different scales drew half its area at one scale and half at the other, which came out as a
     // seam down the middle of the scene with the two sides an exponent apart (cap1_r07: 1.11 left,
     // 2.11 right). Where they disagree the pass runs at the guest size, which is always valid.
     for (uint32_t i = 0; i < 4; ++i) {
       if (targets.color[i] && targets.color[i]->scale_q != pass_scale_q) {
-        if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] pass attachments disagree: colour {} is {}/4, the pass is {}/4",
+        if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] pass attachments disagree: colour {} is {}/16, the pass is {}/16",
                     i, targets.color[i]->scale_q, pass_scale_q);
         pass_scale_q = shd::render_scale::kNative;
         break;
@@ -6326,6 +6506,24 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   if (!guest_count) {
     return;
   }
+  // Native UI is paid for only when this frame really contains Scaleform text. The shape is the
+  // same linear k_8 1024x1024 GFx glyph cache already used by p2_diag_glyph_draws; its address may
+  // move, so do not key the decision on one allocation.
+  static const bool native_ui_requested = REXCVAR_GET(shd_ui_native);
+  bool native_ui_text = false;
+  if (native_ui_requested) {
+    for (uint32_t s = 0; s < 4 && !native_ui_text; ++s) {
+      const xenos::xe_gpu_texture_fetch_t tf = r.GetTextureFetch(s);
+      native_ui_text = tf.type == xenos::FetchConstantType::kTexture && tf.base_address &&
+                       uint32_t(tf.format) == uint32_t(xenos::TextureFormat::k_8) && !tf.tiled &&
+                       tf.size_2d.width == 1023 && tf.size_2d.height == 1023;
+    }
+  }
+  static bool native_ui_gate_logged = false;
+  if (!native_ui_gate_logged) {
+    native_ui_gate_logged = true;
+    if (ShdDiagScaleOn()) REXLOG_INFO("[shd-ui] glyph detection enabled {}", native_ui_requested);
+  }
   {
     // Diagnostic (p2_diag_draw_sequence): one [draw-seq] line per draw in a window of draws, with the colour and
     // depth target and the texture 0 address, format and swizzle. Same fields as the Mass Effect renderer, so the
@@ -7173,7 +7371,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
 
   stage_marks.Mark(p2::stage::kDrawSystem);
   // Record.
-  if (!BeginPass(targets)) return skip(14);
+  if (!BeginPass(targets, native_ui_text)) return skip(14);
   DrawCommand d;
   d.commands = current().main;
   d.flags = 0;
@@ -7215,7 +7413,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
 
   // Dynamic state.
-  // The viewport is in guest pixels and the attachments are q/4 of that: scaled by edges, as the
+  // The viewport is in guest pixels and the attachments are q/16 of that: scaled by edges, as the
   // scissor is, so a viewport and the scissor that bounds it keep agreeing to the pixel.
   VkViewport vp = st.vp;
   if (pass_scale_q != shd::render_scale::kNative) {
@@ -7235,7 +7433,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     if (seen_vp.size() < 24 && seen_vp.insert(vk).second) {
       const RenderTarget* c0 = st.targets.color[0];
       if (ShdDiagScaleOn()) REXLOG_INFO("[shd-vp] guest vp {}x{} at {},{} -> host vp {}x{} at {},{} | pass guest {}x{} "
-                  "scale {}/4 | colour0 guest {}x{} host {}x{} | ndc {} {}",
+                  "scale {}/16 | colour0 guest {}x{} host {}x{} | ndc {} {}",
                   st.vp.width, st.vp.height, st.vp.x, st.vp.y, vp.width, vp.height, vp.x, vp.y,
                   pass_extent.width, pass_extent.height, pass_scale_q, c0 ? c0->width : 0,
                   c0 ? c0->height : 0, c0 ? c0->HostWidth() : 0, c0 ? c0->HostHeight() : 0,
@@ -7753,7 +7951,7 @@ void Renderer::Impl::Resolve() {
           if (!set && resolve_probe_enabled) probe_path = 8;
           if (set) {
             probe_path = 2;
-            // The guest wants the depth of its own pixels, so a target drawn at q/4 is read from a
+            // The guest wants the depth of its own pixels, so a target drawn at q/16 is read from a
             // full-size copy. This route was the one that still read the halved image with guest
             // coordinates: the scene's depth (14F68000, sampled by the post effects 94 times a
             // frame) came out as its own top-left quarter stretched over the screen -- the dark
@@ -7889,7 +8087,7 @@ void Renderer::Impl::Resolve() {
         // unscaled it comes out white, which is why the loading screen (a flat image, no bias)
         // looked right while the menu and the forest were blown out. With a bias the staged route
         // below does the stretch and leaves the scaling to the compute copy, which knows how.
-        // The source target was rendered at q/4 of the guest size and the destination is a guest
+        // The source target was rendered at q/16 of the guest size and the destination is a guest
         // texture the game reads back by address and size, so it keeps the guest size: the copy
         // has to stretch. The compute path below addresses both images in the same coordinates
         // and would leave the smaller picture in the corner of a full-size texture.
@@ -7990,7 +8188,7 @@ void Renderer::Impl::Resolve() {
                               (uint64_t(source->HostHeight()) << 32) |
                               (uint64_t(width) << 16) | height;
         if (named.size() < 64 && named.insert(what).second) {
-          if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] unscaled colour resolve: source {}x{} host (scale {}/4), "
+          if (ShdDiagScaleOn()) REXLOG_WARN("[shd-scale] unscaled colour resolve: source {}x{} host (scale {}/16), "
                       "asked {}x{} at {},{}",
                       source->HostWidth(), source->HostHeight(), source->scale_q, width, height,
                       x0, y0);
@@ -8144,7 +8342,7 @@ void Renderer::Impl::Resolve() {
   resolve_barrier_pending = true;
 }
 
-// Copies a render target drawn at q/4 of the guest size into a full-size guest texture, stretching
+// Copies a render target drawn at q/16 of the guest size into a full-size guest texture, stretching
 // as it goes (shd_render_width). Everything the guest sees keeps its own size; only this one copy
 // knows that the source is smaller. Returns false when the device cannot blit the pair, and the
 // caller falls back to its usual paths.
@@ -8193,7 +8391,7 @@ bool Renderer::Impl::BlitScaledResolve(VkCommandBuffer c, const RenderTarget& so
   return true;
 }
 
-// A depth target drawn at q/4 cannot be read back texel by texel: the guest wants the depth of
+// A depth target drawn at q/16 cannot be read back texel by texel: the guest wants the depth of
 // every one of its own pixels and the scaled image simply does not have them. This blits the
 // scaled depth into a full-size scratch image, which the texel-wise routes then read as they
 // always did. Returns the image to read (the target's own when nothing is scaled), or NULL when

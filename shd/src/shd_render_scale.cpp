@@ -22,8 +22,8 @@ REXCVAR_DEFINE_UINT32(shd_render_width, 1280, "SilentHill",
                       "80 (the Xbox 360 EDRAM tile grid), 640..1280; restart required")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_UINT32(shd_render_height, 720, "SilentHill",
-                      "Internal render height (the game's own 720). Multiple of 16, 360..720; "
-                      "restart required")
+                      "Display/config height, 360..720. The native renderer derives the exact "
+                      "16:9 height from shd_render_width (for example 720 -> 405); restart required")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {

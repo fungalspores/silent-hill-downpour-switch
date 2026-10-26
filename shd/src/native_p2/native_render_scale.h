@@ -5,13 +5,15 @@
 // identity by address and size, 1/size in the texture constants) is unchanged. Only the Vulkan
 // commands use host coordinates, converted here.
 //
-// The scale is kept as quarters q, where q == 4 is the game's own resolution and the whole path
-// is identity: not one instruction differs from the renderer without this feature. That is what
-// makes it safe to leave in all the time.
+// The scale is kept as sixteenths q, where q == 16 is the game's own resolution and the whole
+// path is identity: not one instruction differs from the renderer without this feature. Sixteenths
+// retain the old 640/960/1280 presets exactly and also allow intermediate 80-pixel steps such as
+// 720x405. That is what makes it safe to leave in all the time.
 //
-// A guest pixel EDGE e maps to the host edge E(e) = floor((2*e*q + 3) / 8). Edges, not sizes:
+// A guest pixel EDGE e maps to the host edge E(e) = floor((2*e*q + 12) / 32). Edges, not sizes:
 // adjacent guest rectangles then cover disjoint host pixels with no gap and no overlap, which
-// scaling widths independently cannot promise.
+// scaling widths independently cannot promise. For q = 8, 12 and 16 this is bit-for-bit the old
+// quarters formula with q = 2, 3 and 4 respectively.
 #ifndef SHD_NATIVE_RENDER_SCALE_H_
 #define SHD_NATIVE_RENDER_SCALE_H_
 
@@ -23,15 +25,15 @@
 
 namespace shd::render_scale {
 
-inline constexpr uint32_t kNative = 4;  // q of the game's own 1280x720
+inline constexpr uint32_t kNative = 16;  // q of the game's own 1280x720
 
 // Host edge of a guest pixel edge (any sign).
 constexpr int32_t ScaleEdge(int32_t guest, uint32_t q) {
   if (q == kNative) {
     return guest;
   }
-  const int64_t n = 2 * int64_t(guest) * int64_t(q) + 3;
-  return int32_t(n >= 0 ? n / 8 : -((-n + 7) / 8));
+  const int64_t n = 2 * int64_t(guest) * int64_t(q) + 12;
+  return int32_t(n >= 0 ? n / 32 : -((-n + 31) / 32));
 }
 
 constexpr uint32_t ScaleSize(uint32_t guest, uint32_t q) {
@@ -54,8 +56,8 @@ inline VkRect2D ScaleRect(const VkRect2D& guest, uint32_t q) {
                   {uint32_t(x1 > x0 ? x1 - x0 : 0), uint32_t(y1 > y0 ? y1 - y0 : 0)}};
 }
 
-// The quarters the cvars ask for, 2 (360p) to 4 (720p). Read once per session.
-uint32_t WantedQuarters();
+// The sixteenths the cvars ask for, 8 (360p) to 16 (720p). Read once per session.
+uint32_t WantedScale16();
 bool Enabled();
 
 }  // namespace shd::render_scale

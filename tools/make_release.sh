@@ -2,7 +2,7 @@
 # Builds the release folder: NRO + toml, rex-start, NSP forwarder, README, licenses.
 # No game data and nothing derived from it. The prewarm file is forbidden too: its header lists
 # shaders and stores their Xenos microcode, not merely pipeline keys and hashes.
-#   VER=0.2.0 NRO=<shd.nro> TOML=<release shd.toml> REXSTART=<rex-start.nro>
+#   VER=0.3.0 NRO=<shd.nro> TOML=<release shd.toml> REXSTART=<rex-start.nro>
 #   NSP=<forwarder nsp> OUT=<output folder> sh tools/make_release.sh
 set -e
 G=$(cd "$(dirname "$0")/.." && pwd)

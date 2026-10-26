@@ -54,10 +54,14 @@ static const option options[] =
       { "640", "720", "960", "1280", NULL },
       { "640x352", "720x400", "960x544", "1280x720", NULL }, "720" },
     { "shd", "shd_render_width", "Разрешение", "Resolution",
-      "Внутреннее, растягивается на экран. Меньше — быстрее и холоднее, но мыльнее.",
-      "Internal, scaled to the screen. Lower is faster and cooler but softer.",
-      { "640", "960", "1280", NULL },
-      { "640x360", "960x540", "1280x720", NULL }, "640" },
+      "Внутреннее, растягивается FSR. Меньше — быстрее и холоднее, но мыльнее.",
+      "Internal, scaled with FSR. Lower is faster and cooler but softer.",
+      { "1280", "1120", "1040", "960", "880", "800", "720", "640", NULL },
+      { "1280x720", "1120x630", "1040x585", "960x540", "880x495", "800x450", "720x405", "640x360", NULL }, "720" },
+    { "shd", "shd_ui_native", "Качество субтитров", "Subtitle quality",
+      "Чёткий текст и UI. Немного больше нагрузки, только когда текст на экране.",
+      "Sharper text and UI. A little extra GPU work only while text is on screen.",
+      { "false", "true", NULL }, { "обычные / standard", "чёткие / high", NULL }, "true" },
 };
 
 #define OPTION_COUNT ((int)(sizeof(options) / sizeof(options[0])))
@@ -191,11 +195,11 @@ static const char *height_for( const char *width )
     return NULL;
 }
 
-/* Silent Hill's own frame is 1280x720, a true 16:9, and its heights are multiples of 16 rather
- * than the Prototypes' grid. Its own 720 is kept exact instead of coming out of the arithmetic. */
+/* Silent Hill's frame is a true 16:9. The native renderer accepts 80-pixel width steps and
+ * derives the exact height from the width, so the TOML and the displayed values must agree. */
 static const char *shd_height_for( const char *width )
 {
-    static const char *pairs[][2] = { { "640", "360" }, { "720", "400" }, { "800", "448" }, { "880", "496" },
+    static const char *pairs[][2] = { { "640", "360" }, { "720", "405" }, { "800", "450" }, { "880", "495" },
                                       { "960", "540" }, { "1040", "585" }, { "1120", "630" }, { "1280", "720" } };
     unsigned int i;
 
